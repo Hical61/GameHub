@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "gamehub",
+  "version-semver": "0.1.0",
+  "description": "接收多款游戏的渠道回调，向游戏服发送通知和分发配置",
+  "homepage": "https://github.com/Hical61/GameHub",
+  "license": "MIT",
+  "builtin-baseline": "301856f5f2824f788a3ffa6332293861cccd23b4",
+  "dependencies": [
+    "boost-asio",
+    "boost-charconv",
+    "boost-json",
+    "boost-mysql",
+    "openssl",
+    "zlib"
+  ]
+}

@@ -1,0 +1,68 @@
+# 补丁只在构建目录里的副本应用，不改调用者提供的 Hical 工作区。
+function(gamehub_prepare_hical source output)
+    set(patch "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/patches/hical-response-body-limit.patch")
+    set(files
+        src/asio/HttpClient.h src/asio/HttpClient.cpp src/asio/HttpClientPool.cpp
+        src/core/Error.h src/core/Error.cpp)
+    set(hashes
+        fbbbfd1ff468d5f47355c43344853f2a26002151c5caafb1776b195f030a2123
+        b662abf7cedec435426c4b016a116a49099599cc24e9819f5e5c7c6df0413fe7
+        ade4f7c89aaab13f39bc1471c23b13f1a668b69a2ed0ca8303a4c6d77346fd71
+        26c54bb37e23b872f0c12c08039889fac7fa650804b76058c0d41a9614802949
+        a036dfb1267339a415fd745bc26753f374d4637c03f98b7945116be7ba7c1e29)
+    foreach(file expected IN ZIP_LISTS files hashes)
+        if(NOT EXISTS "${source}/${file}")
+            message(FATAL_ERROR "Hical 源码缺少 ${file}，请按 README 获取固定版本。")
+        endif()
+        file(READ "${source}/${file}" original)
+        string(REPLACE "\r\n" "\n" original "${original}")
+        string(SHA256 actual "${original}")
+        if(NOT actual STREQUAL expected)
+            message(FATAL_ERROR "Hical 的 ${file} 与固定版本不一致。请使用 README 中的干净依赖；不会修改已有工作区。")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${source}/${file}")
+    endforeach()
+    find_package(Git REQUIRED)
+    file(SHA256 "${patch}" patch_hash)
+    file(REAL_PATH "${source}" source_path)
+    set(signature "${source_path}\n${patch_hash}\n")
+    set(destination "${CMAKE_BINARY_DIR}/_deps/hical-response-limit")
+    set(marker "${destination}/gamehub-patch.txt")
+    set(previous "")
+    if(EXISTS "${marker}")
+        file(READ "${marker}" previous)
+    endif()
+    if(NOT previous STREQUAL signature)
+        file(MAKE_DIRECTORY "${destination}")
+        string(FIND "${previous}" "${source_path}\n" same_source)
+        if(NOT same_source EQUAL 0)
+            file(COPY "${source}/" DESTINATION "${destination}"
+                PATTERN ".git" EXCLUDE PATTERN "build*" EXCLUDE PATTERN ".local" EXCLUDE)
+        endif()
+        set(staging "${CMAKE_BINARY_DIR}/_deps/hical-response-limit-patch")
+        foreach(file IN LISTS files)
+            file(READ "${source}/${file}" original)
+            string(REPLACE "\r\n" "\n" original "${original}")
+            get_filename_component(parent "${staging}/${file}" DIRECTORY)
+            file(MAKE_DIRECTORY "${parent}")
+            file(WRITE "${staging}/${file}" "${original}")
+        endforeach()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${patch}"
+            WORKING_DIRECTORY "${staging}" RESULT_VARIABLE checked ERROR_VARIABLE detail)
+        if(NOT checked EQUAL 0)
+            message(FATAL_ERROR "Hical 响应上限补丁无法应用：${detail}")
+        endif()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${patch}"
+            WORKING_DIRECTORY "${staging}" RESULT_VARIABLE applied ERROR_VARIABLE detail)
+        if(NOT applied EQUAL 0)
+            message(FATAL_ERROR "Hical 响应上限补丁应用失败：${detail}")
+        endif()
+        foreach(file IN LISTS files)
+            # 内容没变就保留时间戳，修改补丁时只重编真正变化的文件。
+            configure_file("${staging}/${file}" "${destination}/${file}" COPYONLY)
+        endforeach()
+        file(WRITE "${marker}" "${signature}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${patch}")
+    set(${output} "${destination}" PARENT_SCOPE)
+endfunction()

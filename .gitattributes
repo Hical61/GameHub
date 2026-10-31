@@ -1,0 +1,15 @@
+# 源码和文档统一使用 LF；Windows 命令脚本保留原生命令行换行。
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制附件不做换行转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.7z binary
+cmake/licenses/*.rtf binary

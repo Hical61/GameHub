@@ -1,0 +1,79 @@
+/** @file Config.h
+ * @brief 服务配置、游戏和区服地址。
+ */
+#pragma once
+#include <cstdint>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace gamehub
+{
+	class ConfigError : public std::runtime_error
+	{
+	public:
+		/// @param message 错误说明，不能包含配置值或密钥。
+		explicit ConfigError(const std::string& message) : std::runtime_error(message)
+		{
+		}
+	};
+
+	struct ServerEndpoint
+	{
+		std::uint32_t id = 0;
+		std::string host;
+		std::uint16_t port = 0;
+		std::string target;
+	};
+
+	struct GameConfig
+	{
+		std::string id;
+		std::string callbackSecret;
+		std::string outboundSecret;
+		std::vector<ServerEndpoint> servers;
+		/// @param serverId 区服编号。@return 对应的目标地址；未配置时抛 ApiError。
+		const ServerEndpoint& endpoint(std::uint32_t serverId) const;
+	};
+
+	struct WorkerConfig
+	{
+		static constexpr std::size_t kDefaultMaxResponseBodyBytes = 16 * 1024;
+
+		unsigned pollMs = 1000;
+		unsigned concurrency = 4;
+		unsigned leaseSeconds = 60;
+		unsigned maxAttempts = 8;
+		unsigned baseRetrySeconds = 2;
+		unsigned maxRetrySeconds = 300;
+		unsigned connectTimeoutMs = 2000;
+		unsigned requestTimeoutMs = 5000;
+		std::size_t maxResponseBodyBytes = kDefaultMaxResponseBodyBytes;
+	};
+
+	struct Config
+	{
+		std::string listen;
+		std::uint16_t port = 0;
+		std::size_t maxBodyBytes = 0;
+		std::size_t maxConnections = 0;
+		std::string dbHost;
+		std::uint16_t dbPort = 0;
+		std::string dbName;
+		std::string dbUser;
+		std::string dbPassword;
+		unsigned dbMaxConnections = 0;
+		std::string jwtSecret;
+		std::string jwtIssuer;
+		std::string jwtAudience;
+		WorkerConfig worker;
+		std::vector<GameConfig> games;
+		/// @param gameId 游戏标识。@return 对应的游戏配置；未配置时抛 ApiError。
+		const GameConfig& game(std::string_view gameId) const;
+	};
+
+	/// @param path 标准 JSON 配置文件的路径。@return 检查通过的配置；密钥从环境变量读取，错误信息不带配置值。
+	Config loadConfig(const std::filesystem::path& path);
+} // namespace gamehub

@@ -1,0 +1,5 @@
+#!/bin/sh
+# 上传前同时检查当前文件和所有本地引用；任一失败就停止推送。
+set -eu
+python scripts/check-release.py --all-files
+python scripts/check-history.py

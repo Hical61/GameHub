@@ -1,0 +1,18 @@
+groups:
+  - name: gamehub
+    rules:
+      - alert: GameHubUnavailable
+        expr: up{job="gamehub"} == 0
+        for: 1m
+        annotations:
+          summary: GameHub 指标抓取失败，请检查服务、数据库和采集令牌。
+      - alert: GameHubFailedTasks
+        expr: gamehub_tasks{state="failed"} > 0
+        for: 1m
+        annotations:
+          summary: 有投递任务失败，请先核对游戏服流水，再决定是否重排。
+      - alert: GameHubPendingTooLong
+        expr: gamehub_oldest_pending_seconds > 60
+        for: 2m
+        annotations:
+          summary: 待投递任务超过示例阈值，请检查目标服务和槽位占用。

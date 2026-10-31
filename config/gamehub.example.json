@@ -1,0 +1,47 @@
+{
+  "server": {
+    "listen": "127.0.0.1",
+    "port": 8443,
+    "maxBodyBytes": 65536,
+    "maxConnections": 1024
+  },
+  "hubDb": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "gamehub",
+    "user": "gamehub",
+    "maxConnections": 8
+  },
+  "worker": {
+    "pollMs": 1000,
+    "concurrency": 4,
+    "leaseSeconds": 60,
+    "maxAttempts": 8,
+    "baseRetrySeconds": 2,
+    "maxRetrySeconds": 300,
+    "connectTimeoutMs": 2000,
+    "requestTimeoutMs": 5000,
+    "maxResponseBodyBytes": 16384
+  },
+  "auth": {
+    "jwtSecretEnv": "GAMEHUB_ADMIN_JWT_SECRET",
+    "issuer": "gamehub-admin",
+    "audience": "gamehub"
+  },
+  "games": [
+    {
+      "id": "demo",
+      "adapter": "demo-hmac-v1",
+      "callbackSecretEnv": "GAMEHUB_DEMO_CALLBACK_SECRET",
+      "outboundSecretEnv": "GAMEHUB_DEMO_OUTBOUND_SECRET",
+      "servers": [
+        {
+          "id": 1,
+          "host": "127.0.0.1",
+          "port": 9001,
+          "target": "/internal/gamehub"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,256 @@
+--- a/src/asio/HttpClient.h
++++ b/src/asio/HttpClient.h
+@@ -89,6 +89,9 @@
+ 		/// 单次请求超时默认值：写完请求到读完整段响应的总限时
+ 		static constexpr auto kDefaultRequestTimeout = std::chrono::seconds {30};
+ 
++		/// 响应体默认最多 8 MiB；响应头和解码缓冲另有固定上限。
++		static constexpr std::size_t kDefaultMaxResponseBodyBytes = 8 * 1024 * 1024;
++
+ 		/** TLS 上下文（用 ssl::context::tls_client 构造），非空即启用 HTTPS */
+ 		std::shared_ptr<SslContext> tlsContext;
+ 
+@@ -103,6 +106,9 @@
+ 
+ 		/** 单次请求（写请求 + 读完整响应）的时限；非正值表示不设超时 */
+ 		std::chrono::steady_clock::duration requestTimeout {kDefaultRequestTimeout};
++
++		/** 解码后的响应体总字节上限；0 只接受空响应体。 */
++		std::size_t maxResponseBodyBytes {kDefaultMaxResponseBodyBytes};
+ 	};
+ 
+ 	/**
+@@ -252,6 +258,9 @@
+ 											  std::string_view body,
+ 											  const HeaderMap& headers);
+ 
++		/// @param result 当前响应；data/size 待追加字节。@return 未超限时追加并返回 true；否则清空响应并关闭连接。
++		bool appendResponseBody(HttpClientResult& result, const char* data, std::size_t size);
++
+ 		/// 确保连接已建立：按需 resolve + connect，TLS 再握手。失败时已经 close() 过
+ 		/// （连接不可复用），成功时 state_ 置 hActive。TLS 每次重连都重建 ssl::stream，
+ 		/// 规避 SSL 会话状态残留。
+--- a/src/asio/HttpClient.cpp
++++ b/src/asio/HttpClient.cpp
+@@ -46,6 +46,9 @@
+ 		/// 解析响应头预留的槽位，跟服务端保持一致
+ 		constexpr std::size_t kMaxResponseHeaders = 64;
+ 
++		/// 单次请求最多接受 16 个中间响应，全部响应头累计不超过 kMaxRecvBuffer。
++		constexpr std::size_t kMaxInformationalResponses = 16;
++
+ 		/// HTTP 默认端口：Host 头里是默认端口就不用回填
+ 		constexpr uint16_t kDefaultHttpPort = 80;
+ 
+@@ -378,6 +381,20 @@
+ 			return requestOn<TlsSocket>(method, target, body, headers);
+ 		}
+ 		return requestOn<PlainSocket>(method, target, body, headers);
++	}
++
++	bool HttpClient::appendResponseBody(HttpClientResult& result, const char* data, std::size_t size)
++	{
++		// 已保存的字节始终不超过限额，用减法检查本次追加，避免加法溢出。
++		if (size > options_.maxResponseBodyBytes - result.body.size())
++		{
++			result.error = {ErrorCode::hResponseBodyTooLarge, "response body exceeds byte limit"};
++			result.body.clear();
++			close();
++			return false;
++		}
++		result.body.append(data, size);
++		return true;
+ 	}
+ 
+ 	template <typename SocketType>
+@@ -542,8 +559,16 @@
+ 		}
+ 
+ 		std::size_t headerLen = 0;
++		std::size_t responseHeaderBytes = 0;
++		std::size_t informationalResponses = 0;
+ 		for (;;)
+ 		{
++			if (std::chrono::steady_clock::now() >= requestDeadline)
++			{
++				result.error = {ErrorCode::hTimedOut, "request timed out"};
++				close();
++				co_return result;
++			}
+ 			if (recvUsed_ > prevLen)
+ 			{
+ 				numHeaders = kMaxResponseHeaders;
+@@ -561,6 +586,36 @@
+ 				if (parseResult > 0)
+ 				{
+ 					headerLen = static_cast<std::size_t>(parseResult);
++					result.status = status;
++					if (headerLen > kMaxRecvBuffer - responseHeaderBytes)
++					{
++						result.error = {ErrorCode::hUnknown, "response headers exceed byte limit"};
++						close();
++						co_return result;
++					}
++					responseHeaderBytes += headerLen;
++					if (status == 101)
++					{
++						// 普通连接池不接管升级后的协议，也不能把它放回 HTTP 空闲桶。
++						result.error = {ErrorCode::hUnknown, "HTTP protocol upgrade is not supported"};
++						close();
++						co_return result;
++					}
++					if (status >= 100 && status < 200)
++					{
++						if (++informationalResponses > kMaxInformationalResponses)
++						{
++							result.error = {ErrorCode::hUnknown, "too many informational responses"};
++							close();
++							co_return result;
++						}
++						// 只消费当前中间响应，保留已收到的最终响应；不收录中间响应头。
++						// deadline 不重置，后续解析和读取仍共用本次请求的总预算。
++						recvUsed_ -= headerLen;
++						std::memmove(recvBuf_.data(), recvBuf_.data() + headerLen, recvUsed_);
++						prevLen = 0;
++						continue;
++					}
+ 					break;
+ 				}
+ 				if (parseResult == -1)
+@@ -571,6 +626,14 @@
+ 					co_return result;
+ 				}
+ 				// -2：数据不完整，落到下面继续 read
++			}
++
++			// 当前头尚未完整时，缓冲中的字节全属于头；累计预算用减法检查。
++			if (recvUsed_ >= kMaxRecvBuffer - responseHeaderBytes)
++			{
++				result.error = {ErrorCode::hUnknown, "response headers exceed byte limit"};
++				close();
++				co_return result;
+ 			}
+ 
+ 			if (recvUsed_ >= recvBuf_.size())
+@@ -624,9 +687,9 @@
+ 		// ====== 读 body ======
+ 		// 三条路：chunked / Content-Length / 读到 EOF。Transfer-Encoding 优先于
+ 		// Content-Length（RFC 7230 §3.3.3），两个同时出现按 chunked 走。
+-		// 1xx / 204 / 304 按规范就没有 body，别去等 EOF 把连接吊死。
++		// 中间响应已消费；最终 204 / 304 没有 body，不等待 EOF。
+ 		bool isChunked = headerHasToken(result.headers.find("Transfer-Encoding"), "chunked");
+-		bool bodyless = (status >= 100 && status < 200) || status == 204 || status == 304;
++		bool bodyless = status == 204 || status == 304;
+ 		bool reachedEof = false;
+ 
+ 		if (bodyless)
+@@ -641,13 +704,18 @@
+ 			//   -1：编码错误；
+ 			//   >=0：解码完成，返回值是 chunked 之后的残留字节数（从 buf[*len] 起）。
+ 			struct phr_chunked_decoder decoder = {};
++			// 收完整个终止块和 trailers，避免残留字节影响下一次复用。
++			decoder.consume_trailer = 1;
+ 			for (;;)
+ 			{
+ 				std::size_t decodedLen = recvUsed_;
+ 				ssize_t decodeRet = phr_decode_chunked(&decoder, recvBuf_.data(), &decodedLen);
+ 				if (decodedLen > 0)
+ 				{
+-					result.body.append(recvBuf_.data(), decodedLen);
++					if (!appendResponseBody(result, recvBuf_.data(), decodedLen))
++					{
++						co_return result;
++					}
+ 				}
+ 
+ 				if (decodeRet >= 0)
+@@ -688,9 +756,18 @@
+ 
+ 			if (hasContentLength)
+ 			{
++				if (contentLength > options_.maxResponseBodyBytes)
++				{
++					result.error = {ErrorCode::hResponseBodyTooLarge, "response body exceeds byte limit"};
++					close();
++					co_return result;
++				}
+ 				// 头解析时可能已经把 body 开头（甚至整段）读进来了，先搬走
+ 				std::size_t prefix = std::min(recvUsed_, contentLength);
+-				result.body.append(recvBuf_.data(), prefix);
++				if (!appendResponseBody(result, recvBuf_.data(), prefix))
++				{
++					co_return result;
++				}
+ 				recvBuf_.erase(0, prefix);
+ 				recvUsed_ -= prefix;
+ 
+@@ -709,7 +786,10 @@
+ 						close();
+ 						co_return result;
+ 					}
+-					result.body.append(chunk, bytesRead);
++					if (!appendResponseBody(result, chunk, bytesRead))
++					{
++						co_return result;
++					}
+ 					remaining -= bytesRead;
+ 				}
+ 			}
+@@ -717,7 +797,10 @@
+ 			{
+ 				// 没有长度信息也没 chunked：读到对端关连接为止，EOF 收尾
+ 				reachedEof = true;
+-				result.body.append(recvBuf_.data(), recvUsed_);
++				if (!appendResponseBody(result, recvBuf_.data(), recvUsed_))
++				{
++					co_return result;
++				}
+ 				recvUsed_ = 0;
+ 
+ 				char chunk[kBodyReadChunk];
+@@ -738,7 +821,10 @@
+ 						close();
+ 						co_return result;
+ 					}
+-					result.body.append(chunk, bytesRead);
++					if (!appendResponseBody(result, chunk, bytesRead))
++					{
++						co_return result;
++					}
+ 				}
+ 			}
+ 		}
+--- a/src/asio/HttpClientPool.cpp
++++ b/src/asio/HttpClientPool.cpp
+@@ -163,6 +163,8 @@
+ 													  const HttpClientOptions& options)
+ 	{
+ 		std::string key = makeBucketKey(host, port, options.tlsContext != nullptr);
++		// 限额属于连接配置；不同限额不复用，防止旧连接沿用更宽的限制。
++		key.append(":body-limit:").append(std::to_string(options.maxResponseBodyBytes));
+ 
+ 		auto bucketIt = impl.buckets.find(key);
+ 		if (bucketIt != impl.buckets.end())
+--- a/src/core/Error.h
++++ b/src/core/Error.h
+@@ -71,6 +71,9 @@
+ 		hSslInvalidCertificate,
+ 		/** SSL 协议错误 */
+ 		hSslProtocolError,
++
++		/** 解码后的 HTTP 响应体超过配置上限 */
++		hResponseBodyTooLarge,
+ 
+ 		// ============ 未知错误 ============
+ 
+--- a/src/core/Error.cpp
++++ b/src/core/Error.cpp
+@@ -212,6 +212,8 @@
+ 				return "SSL invalid certificate";
+ 			case ErrorCode::hSslProtocolError:
+ 				return "SSL protocol error";
++			case ErrorCode::hResponseBodyTooLarge:
++				return "Response body exceeds byte limit";
+ 			case ErrorCode::hUnknown:
+ 				return "Unknown error";
+ 		}

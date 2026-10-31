@@ -1,0 +1,140 @@
+name: 源码检查与数据库故障测试
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      inject_integration_failure:
+        description: 人为触发集成失败，检查诊断附件
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: gamehub-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: 发布文件检查
+        run: python scripts/check-release.py --all-files
+      - name: 发布历史检查
+        run: python scripts/check-history.py
+      - name: Python 语法检查
+        run: python -m compileall -q scripts examples tests
+      - name: Python 回归
+        run: python -m unittest discover -s tests -p "test_*.py"
+  windows-msvc:
+    needs: source-checks
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/_deps/vcpkg
+      VCPKG_DISABLE_METRICS: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: 下载固定版本的 Hical
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Hical61/Hical
+          ref: 5ba57c95575401bf36499094fcf42eb900707939
+          path: _deps/hical
+          persist-credentials: false
+      - name: 下载固定版本的 vcpkg
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: microsoft/vcpkg
+          ref: 301856f5f2824f788a3ffa6332293861cccd23b4
+          path: _deps/vcpkg
+          persist-credentials: false
+      - name: 初始化 vcpkg
+        run: |
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: 安装依赖并配置 MSVC
+        timeout-minutes: 75
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_MODE=ON -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DVCPKG_HOST_TRIPLET=x64-windows -DGAMEHUB_BUILD_TESTS=ON `
+            "-DGAMEHUB_HICAL_SOURCE=$env:GITHUB_WORKSPACE/_deps/hical"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: 构建 RelWithDebInfo
+        timeout-minutes: 20
+        run: |
+          cmake --build build --config RelWithDebInfo --parallel 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: 核心测试
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+      - name: Python 语法检查
+        run: python -m compileall -q scripts examples tests
+      - name: 安装检查
+        run: python scripts/check-install.py --build-dir build --config RelWithDebInfo
+      - name: 准备固定版本的 MySQL
+        id: mysql
+        timeout-minutes: 10
+        run: python scripts/setup-test-mysql.py --github-output "$env:GITHUB_OUTPUT"
+      - name: MySQL 完整故障集成
+        id: integration
+        timeout-minutes: 15
+        env:
+          GAMEHUB_CI_INJECT_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_integration_failure }}
+          GAMEHUB_CI_MYSQL_BIN: ${{ steps.mysql.outputs.mysql-bin }}
+        run: |
+          $integrationArgs = @('-u', 'tests/integration.py',
+            '--binary', 'build/RelWithDebInfo/gamehub.exe',
+            '--mysql-bin', $env:GAMEHUB_CI_MYSQL_BIN, '--timeout-seconds', '600')
+          if ($env:GAMEHUB_CI_INJECT_FAILURE -eq 'true') {
+            $integrationArgs += '--inject-failure'
+          }
+          python @integrationArgs
+          exit $LASTEXITCODE
+      - name: 响应上限集成
+        id: response-limits
+        timeout-minutes: 15
+        env:
+          GAMEHUB_CI_MYSQL_BIN: ${{ steps.mysql.outputs.mysql-bin }}
+        run: |
+          python -u tests/response_limit_integration.py --binary build/RelWithDebInfo/gamehub.exe `
+            --mysql-bin "$env:GAMEHUB_CI_MYSQL_BIN"
+          exit $LASTEXITCODE
+      - name: 归档和统计集成
+        id: operations
+        timeout-minutes: 15
+        env:
+          GAMEHUB_CI_MYSQL_BIN: ${{ steps.mysql.outputs.mysql-bin }}
+        run: |
+          python -u tests/operations_integration.py --binary build/RelWithDebInfo/gamehub.exe `
+            --mysql-bin "$env:GAMEHUB_CI_MYSQL_BIN"
+          exit $LASTEXITCODE
+      - name: 上传脱敏失败诊断
+        if: ${{ always() && (steps.integration.outcome == 'failure' || steps.response-limits.outcome == 'failure' || steps.operations.outcome == 'failure') }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mysql-integration-diagnostics
+          path: |
+            .local/integration-*-diagnostics/diagnostics.json
+            .local/integration-*-diagnostics/*.log
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

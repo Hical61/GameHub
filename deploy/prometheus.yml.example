@@ -1,0 +1,14 @@
+# 放到 Prometheus 配置中，地址和令牌文件改成实际值。
+# 令牌使用 games=["*"] 的 viewer，凭据文件放在仓库外，并在令牌过期前更新。
+scrape_configs:
+  - job_name: gamehub
+    scrape_interval: 30s
+    scrape_timeout: 5s
+    metrics_path: /admin/metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/gamehub_metrics_token
+    static_configs:
+      - targets: ["127.0.0.1:8443"]
+rule_files:
+  - gamehub-alerts.yml

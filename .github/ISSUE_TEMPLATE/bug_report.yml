@@ -1,0 +1,43 @@
+name: Bug 报告
+description: 说明遇到的问题，以及怎样复现。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先看 README 的构建和演示验证步骤。复现使用合成数据，贴日志和配置前先脱敏。
+        不要上传真实玩家数据、订单、密钥、JWT、数据库密码或生产转储。
+        安全漏洞请按[安全报告说明](https://github.com/Hical61/GameHub/security/policy)反馈，不要公开细节。
+  - type: input
+    id: version
+    attributes:
+      label: 版本或提交号
+      placeholder: 发布标签或提交 SHA
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、编译器、Boost、MySQL 和 Hical 版本；构建问题请补充 CMake 版本与构建命令。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 怎样复现
+      description: 写清测试步骤和合成输入，以及你期望的结果和实际结果。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 脱敏日志与补充信息
+      description: 贴出有助于定位问题的片段即可，没有日志可以留空。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我使用了合成数据，并已检查日志和配置，不包含真实玩家数据或凭据。
+          required: true
