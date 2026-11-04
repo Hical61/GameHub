@@ -8,7 +8,7 @@ import shutil
 import sys
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import integration
 
@@ -120,6 +120,68 @@ class IntegrationDeadlineTests(unittest.TestCase):
             fixture.sql("SELECT '" + secret + "'")
         self.assertEqual(list(fixture.sql_errors), [{"code": 1406, "sqlState": "22001", "line": 3}])
         self.assertNotIn(secret, str(error.exception) + json.dumps(list(fixture.sql_errors)))
+
+
+class IntegrationSuiteTests(unittest.TestCase):
+    def test_default_command_runs_isolated_suites_with_remaining_budget(self):
+        core, multi = Mock(), Mock()
+        now = [100.0]
+        def elapsed(*_args, **_kwargs):
+            now[0] += 100
+        argv = ["integration.py", "--binary", "unused-hub", "--mysql-bin", "unused-mysql"]
+        with patch.object(sys, "argv", argv), \
+                patch.object(integration, "Fixture", return_value=core) as core_factory, \
+                patch.object(integration, "MultiGameFixture", return_value=multi) as multi_factory, \
+                patch.object(integration.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(integration, "run_fixture", side_effect=elapsed) as run, \
+                redirect_stdout(io.StringIO()):
+            integration.main()
+        self.assertEqual(run.call_args_list, [
+            call(core, 600, False, verifier=integration.verify),
+            call(multi, 500, False, verifier=integration.verify_multi_game)])
+        core_factory.assert_called_once_with(Path("unused-hub"), Path("unused-mysql"))
+        multi_factory.assert_called_once_with(Path("unused-hub"), Path("unused-mysql"))
+
+    def test_selected_suite_does_not_create_the_other_instance(self):
+        for suite, active in (("core", 0), ("multi-game", 1)):
+            with self.subTest(suite=suite), \
+                    patch.object(integration, "Fixture") as core_factory, \
+                    patch.object(integration, "MultiGameFixture") as multi_factory, \
+                    patch.object(integration, "run_fixture") as run, redirect_stdout(io.StringIO()):
+                integration.run_suites(Path("unused-hub"), Path("unused-mysql"), suite=suite)
+                factories = (core_factory, multi_factory)
+                factories[active].assert_called_once()
+                factories[1 - active].assert_not_called()
+                self.assertIs(run.call_args.args[0], factories[active].return_value)
+
+    def test_expired_budget_does_not_create_the_next_instance(self):
+        now = [0.0]
+        def expire(*_args, **_kwargs):
+            now[0] = 2.0
+        with patch.object(integration, "Fixture"), \
+                patch.object(integration, "MultiGameFixture") as multi_factory, \
+                patch.object(integration.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(integration, "run_fixture", side_effect=expire), \
+                self.assertRaises(integration.IntegrationDeadlineExceeded):
+            integration.run_suites(Path("unused-hub"), Path("unused-mysql"), timeout_seconds=1)
+        multi_factory.assert_not_called()
+
+    def test_later_suite_failure_keeps_its_diagnostics_and_original_error(self):
+        core, multi = Mock(), Mock()
+        original = AssertionError("synthetic multi-game failure")
+        with patch.object(integration, "Fixture", return_value=core), \
+                patch.object(integration, "MultiGameFixture", return_value=multi), \
+                patch.object(integration, "verify") as verify, \
+                patch.object(integration, "verify_multi_game", side_effect=original) as verify_multi, \
+                redirect_stdout(io.StringIO()), self.assertRaises(AssertionError) as error:
+            integration.run_suites(Path("unused-hub"), Path("unused-mysql"))
+        self.assertIs(error.exception, original)
+        verify.assert_called_once_with(core)
+        verify_multi.assert_called_once_with(multi)
+        core.close.assert_called_once_with()
+        multi.close.assert_called_once_with(failure=original)
+        self.assertIsNone(multi.run_deadline)
+        self.assertIsNone(integration.ACTIVE_DEADLINE.get())
 
 
 if __name__ == "__main__":

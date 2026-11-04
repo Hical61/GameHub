@@ -14,6 +14,9 @@ namespace gamehub
 	inline constexpr std::size_t kMaxKeyLength = 96;
 	inline constexpr std::size_t kMaxPayloadBytes = 48 * 1024;
 	inline constexpr int kSignatureWindowSeconds = 300;
+	inline constexpr unsigned kMaxContractVersion = 65535;
+	inline constexpr unsigned kCurrentPayloadVersion = 1;
+	inline constexpr unsigned kCurrentFingerprintVersion = 1;
 
 	enum class TaskStatus : int
 	{
@@ -44,6 +47,8 @@ namespace gamehub
 		std::string fingerprint;
 		std::vector<std::uint32_t> servers;
 		std::string actor;
+		unsigned payloadVersion = kCurrentPayloadVersion;
+		unsigned fingerprintVersion = kCurrentFingerprintVersion;
 	};
 
 	struct DeliveryTask
@@ -56,6 +61,10 @@ namespace gamehub
 		std::string bizKey;
 		std::string payload;
 		unsigned attempts = 0;
+		std::uint64_t eventId = 0;
+		std::string nameSpace;
+		unsigned payloadVersion = kCurrentPayloadVersion;
+		unsigned fingerprintVersion = kCurrentFingerprintVersion;
 	};
 
 	/// @param text 待检查的标识；maxLength 长度上限。@return 是否满足 ASCII 标识的字符和长度限制。

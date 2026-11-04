@@ -2,8 +2,8 @@
  * @brief 全部应用状态都在同一个事件循环中访问，连接池不跨线程使用。
  */
 #include "Application.h"
+#include "IngressLimits.h"
 #include "core/Crypto.h"
-#include "games/DemoGameAdapter.h"
 #include <boost/asio/cancel_after.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -12,7 +12,7 @@
 #include <charconv>
 #include <core/JwtAuth.h>
 #include <core/Log.h>
-#include <core/RateLimiter.h>
+#include <algorithm>
 #include <csignal>
 #include <limits>
 
@@ -24,8 +24,6 @@ namespace gamehub
 		constexpr auto kMonitorInterval = std::chrono::seconds(30);
 		constexpr double kIdleTimeoutSeconds = 15;
 		constexpr double kShutdownTimeoutSeconds = 20;
-		constexpr double kRatePerSecond = 100;
-		constexpr double kRateBurst = 200;
 		constexpr unsigned kBacklogAlertSeconds = 60;
 
 		hical::HttpResponse response(int status, const boost::json::value& body)
@@ -66,11 +64,21 @@ namespace gamehub
 					request.path(),
 					request.body()};
 		}
+
+		hical::HttpResponse callbackResponse(CallbackReply reply)
+		{
+			hical::HttpResponse result;
+			result.setStatus(static_cast<hical::HttpStatusCode>(reply.status));
+			result.setHeader("Cache-Control", "no-store");
+			result.setBody(std::move(reply.body), reply.contentType);
+			return result;
+		}
 	} // namespace
 
-	Application::Application(Config config)
+	Application::Application(Config config, GameRegistry registry)
 		: config_(std::move(config))
 		, server_(config_.port, 1)
+		, registry_(std::move(registry))
 		, database_(std::make_shared<Database>(server_.ioContext().get_executor(), config_))
 		, store_(database_)
 		, http_(server_.ioContext())
@@ -79,7 +87,12 @@ namespace gamehub
 	{
 		for (const auto& game : config_.games)
 		{
-			registry_.add(std::make_unique<DemoGameAdapter>(game));
+			if (config_.worker.games.empty()
+				|| std::find(config_.worker.games.begin(), config_.worker.games.end(), game.id)
+					   != config_.worker.games.end())
+			{
+				recoveryGames_.push_back(game.id);
+			}
 		}
 		server_.listen(config_.listen, config_.port);
 		server_.setMaxBodySize(config_.maxBodyBytes);
@@ -110,7 +123,10 @@ namespace gamehub
 					self->stop();
 				}
 			});
-		HICAL_LOG_INFO("GameHub 0.1 启动，监听 {}:{}，演示渠道适配器已启用", config_.listen, config_.port);
+		HICAL_LOG_INFO("GameHub 0.1 启动，监听 {}:{}，已注册 {} 款游戏",
+					   config_.listen,
+					   config_.port,
+					   config_.games.size());
 		try
 		{
 			server_.start();
@@ -138,44 +154,7 @@ namespace gamehub
 
 	void Application::registerRoutes()
 	{
-		// 回调、管理和内部接口分别限流，探针不参与。回调量大时也要能查管理接口。
-		auto limiter = hical::makeRateLimiterMiddleware({.config = {kRatePerSecond, kRateBurst},
-														 .keyExtractor = [](const hical::HttpRequest& request)
-														 {
-															 if (request.path().starts_with("/api/callback/"))
-															 {
-																 return std::string("callback");
-															 }
-															 return request.path().starts_with("/admin/")
-																		? std::string("admin")
-																		: std::string("internal");
-														 }});
-		server_.use(hical::SyncBeforeHandler(
-			[limiter = std::move(limiter)](hical::HttpRequest& request) -> std::optional<hical::HttpResponse>
-			{
-				// 先检查路径再选择限流桶，避免代理和路由解释出不同路径。验签仍用原始 PATH。
-				const auto path = request.path();
-				if (path.empty() || path.front() != '/' || path.find_first_of("%+\\") != std::string_view::npos
-					|| path.find("//") != std::string_view::npos || path.find("/./") != std::string_view::npos
-					|| path.find("/../") != std::string_view::npos || path.ends_with("/.") || path.ends_with("/.."))
-				{
-					// 此时 body 还没读完，直接关连接，不再处理后面的流水请求。
-					request.native().keepAlive = false;
-					return response(400,
-									boost::json::object {{"error", "请直接使用约定的路径，不要编码或添加特殊路径段"}});
-				}
-				if (request.path() == "/admin/health" || request.path() == "/admin/ready")
-				{
-					return std::optional<hical::HttpResponse> {};
-				}
-				auto limited = limiter(request);
-				if (limited)
-				{
-					// 请求还没读完就拒绝了，必须关连接，否则残留数据可能被当成新请求解析。
-					request.native().keepAlive = false;
-				}
-				return limited;
-			}));
+		server_.use(makeIngressLimits(config_));
 		const auto handler =
 			[weak = weak_from_this()](const hical::HttpRequest& request) -> hical::Awaitable<hical::HttpResponse>
 		{
@@ -190,6 +169,9 @@ namespace gamehub
 		router.get("/admin/health", handler);
 		router.get("/admin/ready", handler);
 		router.get("/admin/stats", handler);
+		router.get("/admin/stats/{game}", handler);
+		router.get("/admin/runtime", handler);
+		router.get("/admin/runtime/{game}", handler);
 		router.get("/admin/metrics", handler);
 		router.get("/admin/tasks/{game}/{after}", handler);
 		router.get("/admin/archive/{game}/{after}", handler);
@@ -219,7 +201,8 @@ namespace gamehub
 									{
 										co_await self->store_.checkSchema();
 										self->schemaReady_ = true;
-										const auto count = co_await self->store_.recover(self->config_.worker);
+										const auto count =
+											co_await self->store_.recover(self->config_.worker, self->recoveryGames_);
 										if (count > 0)
 										{
 											HICAL_LOG_WARN("已回收过期的投递租约，count={}", count);
@@ -288,7 +271,7 @@ namespace gamehub
 	{
 		try
 		{
-			if (request.target().find('?') != std::string_view::npos)
+			if (!request.path().starts_with("/api/callback/") && request.target().find('?') != std::string_view::npos)
 			{
 				throw ApiError(400, "当前接口不接受查询参数");
 			}
@@ -395,15 +378,45 @@ namespace gamehub
 
 	Awaitable<hical::HttpResponse> Application::callback(const hical::HttpRequest& request)
 	{
-		const auto& adapter = registry_.find(request.param("game"));
-		auto input = adapter.parseCallback(request.param("channel"), signedRequest(request), unixSeconds());
-		auto result =
-			co_await boost::asio::co_spawn(server_.ioContext(),
-										   store_.accept(std::move(input)),
-										   boost::asio::cancel_after(kCallbackTimeout, boost::asio::use_awaitable));
-		++accepted_;
-		duplicates_ += result.duplicate;
-		co_return response(200, acceptedBody(result));
+		const auto& channel = registry_.channel(request.param("game"), request.param("channel"));
+		CallbackResult outcome;
+		try
+		{
+			if (!schemaReady_ || stopping_)
+			{
+				throw ApiError(503, "服务未就绪");
+			}
+			const CallbackRequest view {.method = hical::httpMethodToString(request.method()),
+										.path = request.path(),
+										.target = request.target(),
+										.body = request.body(),
+										.header = [&request](std::string_view name)
+										{
+											return request.header(name);
+										}};
+			auto input = channel.parseCallback(view, unixSeconds());
+			const auto result =
+				co_await boost::asio::co_spawn(server_.ioContext(),
+											   store_.accept(std::move(input)),
+											   boost::asio::cancel_after(kCallbackTimeout, boost::asio::use_awaitable));
+			++accepted_;
+			duplicates_ += result.duplicate;
+			outcome = {.status = 200, .eventId = result.eventId, .duplicate = result.duplicate};
+		}
+		catch (const ApiError& error)
+		{
+			++rejected_;
+			outcome.status = error.status;
+			outcome.message = error.what();
+		}
+		catch (const std::exception&)
+		{
+			++rejected_;
+			HICAL_LOG_ERROR("渠道请求受理失败，请按原业务身份重试");
+			outcome.status = 503;
+			outcome.message = "依赖服务暂时不可用，请保留原业务键重试";
+		}
+		co_return callbackResponse(channel.reply(outcome));
 	}
 
 	Submission Application::submission(const hical::HttpRequest& request, std::string taskType, std::string actor) const
@@ -505,13 +518,13 @@ namespace gamehub
 			co_return response(schemaReady_ && !stopping_ ? 200 : 503,
 							   boost::json::object {{"ready", schemaReady_ && !stopping_}});
 		}
-		if (!schemaReady_ || stopping_)
-		{
-			throw ApiError(503, "服务未就绪");
-		}
 		if (path.starts_with("/api/callback/"))
 		{
 			co_return co_await callback(request);
+		}
+		if (!schemaReady_ || stopping_)
+		{
+			throw ApiError(503, "服务未就绪");
 		}
 		if (path.starts_with("/internal/config/"))
 		{
@@ -534,9 +547,29 @@ namespace gamehub
 		{
 			co_return co_await adminWrite(request, actor);
 		}
+		co_return co_await adminRead(request);
+	}
+
+	Awaitable<hical::HttpResponse> Application::adminRead(const hical::HttpRequest& request)
+	{
+		const auto path = request.path();
 		if (path == "/admin/metrics")
 		{
 			co_return co_await metrics();
+		}
+		if (path == "/admin/runtime" || path.starts_with("/admin/runtime/"))
+		{
+			const auto gameId = request.param("game");
+			if (!gameId.empty())
+			{
+				config_.game(gameId);
+			}
+			co_return response(200, worker_.snapshot(gameId));
+		}
+		if (path.starts_with("/admin/stats/"))
+		{
+			const auto& game = config_.game(request.param("game"));
+			co_return response(200, co_await store_.stats(game.id));
 		}
 		if (path == "/admin/stats")
 		{

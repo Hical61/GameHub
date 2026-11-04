@@ -2,13 +2,19 @@
  * @brief 用集成脚本创建的临时库测试租约隔离和异常回滚。
  */
 #include "core/Crypto.h"
+#include "core/DeliveryProtocol.h"
 #include "storage/Store.h"
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/cancel_after.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_future.hpp>
 #include <boost/mysql/common_server_errc.hpp>
+#include <boost/mysql/error_categories.hpp>
+#include <boost/mysql/mysql_server_errc.hpp>
 #include <boost/system/system_error.hpp>
 #include <iostream>
 
@@ -250,6 +256,377 @@ namespace
 		require(co_await store.finish(last, true, "", 0, worker.maxAttempts), "错误后任务无法确认");
 	}
 
+	gamehub::Awaitable<void> verifyScopedClaims(gamehub::Store& store, gamehub::WorkerConfig worker)
+	{
+		using namespace gamehub;
+		worker.maxAttempts = 2;
+		Submission input {"storage-beta",
+						  "announce",
+						  "storage",
+						  "scoped-claim",
+						  "{\"synthetic\":true}",
+						  "",
+						  {1},
+						  "storage-test"};
+		input.fingerprint = sha256(input.payload);
+		co_await store.accept(input);
+		input.gameId = "storage-alpha";
+		input.servers = {1, 2};
+		input.payloadVersion = 2;
+		const auto accepted = co_await store.accept(input);
+		auto task = co_await store.claim(worker, input.gameId, {1});
+		require(task && task->gameId == input.gameId && task->serverId == 2, "范围领取跨游戏或未排除满额区服");
+		require(task->eventId == accepted.eventId && task->nameSpace == input.nameSpace
+					&& canonicalJson(parseObject(task->payload)) == input.payload && task->payloadVersion == 2
+					&& task->fingerprintVersion == kCurrentFingerprintVersion,
+				"领取任务丢失原始载荷、身份或持久化版本");
+		const auto envelope = parseObject(encodeDelivery(*task));
+		require(envelope.at("schemaVersion").to_number<unsigned>() == kDeliverySchemaVersion
+					&& envelope.at("payloadVersion").to_number<unsigned>() == 2
+					&& envelope.at("taskId").as_string() == std::to_string(task->id)
+					&& envelope.at("eventId").as_string() == std::to_string(accepted.eventId)
+					&& envelope.at("namespace").as_string() == input.nameSpace
+					&& canonicalJson(envelope.at("payload")) == input.payload,
+				"协议编码未保留既有字段与业务载荷");
+		require(!(co_await store.claim(worker, input.gameId, {1, 2})), "全部目标满额后仍领取任务");
+		require(!(co_await store.claim(worker, "storage-empty")), "空游戏领取了其他游戏任务");
+		bool rejectedEmpty = false;
+		try
+		{
+			co_await store.claim(worker, "");
+		}
+		catch (const std::invalid_argument&)
+		{
+			rejectedEmpty = true;
+		}
+		require(rejectedEmpty, "空游戏范围退化为全局领取");
+		const auto alpha = co_await store.stats(input.gameId);
+		const auto beta = co_await store.stats("storage-beta");
+		require(alpha.at("pending").to_number<unsigned>() == 1 && alpha.at("delivering").to_number<unsigned>() == 1
+					&& beta.at("pending").to_number<unsigned>() == 1
+					&& beta.at("delivering").to_number<unsigned>() == 0,
+				"按游戏统计串入其他游戏或排除目标消耗了尝试次数");
+		require(co_await store.finish(*task, true, "", 0, worker.maxAttempts), "范围领取任务无法完成");
+		auto remaining = co_await store.claim(worker, input.gameId);
+		require(remaining && remaining->serverId == 1 && remaining->attempts == 1, "排除区服被隐式领取过");
+		require(co_await store.finish(*remaining, true, "", 0, worker.maxAttempts), "剩余目标无法完成");
+		auto other = co_await store.claim(worker, "storage-beta");
+		require(other && other->gameId == "storage-beta", "其他游戏任务丢失");
+		require(co_await store.finish(*other, true, "", 0, worker.maxAttempts), "其他游戏任务无法完成");
+		input.payloadVersion = 1;
+		bool versionConflict = false;
+		try
+		{
+			co_await store.accept(input);
+		}
+		catch (const ApiError& error)
+		{
+			versionConflict = error.status == 409;
+		}
+		require(versionConflict, "重试可改变同一业务身份的持久化版本");
+	}
+
+	gamehub::Awaitable<void> verifyScopedRecovery(std::shared_ptr<gamehub::Database> database,
+												  gamehub::Store& store,
+												  gamehub::WorkerConfig worker)
+	{
+		using namespace gamehub;
+		worker.maxAttempts = 2;
+		Submission input {"storage-alpha", "announce", "storage", "scoped-recovery", "{}", "", {1}, "storage-test"};
+		input.fingerprint = sha256(input.payload);
+		co_await store.accept(input);
+		auto alpha = co_await store.claim(worker, input.gameId);
+		input.gameId = "storage-beta";
+		co_await store.accept(input);
+		auto beta = co_await store.claim(worker, input.gameId);
+		require(alpha && beta, "范围回收测试未能领取两款游戏");
+		{
+			auto session = co_await database->acquire();
+			std::vector<std::string> keys {std::to_string(alpha->id), std::to_string(beta->id)};
+			co_await session.query(
+				"UPDATE delivery_task SET lease_until=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6)) WHERE id IN (?,?)",
+				keys);
+		}
+		require((co_await store.recover(worker, {})) == 0, "空回收范围修改了任务");
+		require((co_await store.recover(worker, {"storage-alpha"})) == 1, "范围回收未仅处理选中游戏");
+		requireTaskState(co_await store.listTasks("storage-beta", 0),
+						 *beta,
+						 TaskStatus::Delivering,
+						 beta->attempts,
+						 beta->generation,
+						 "范围回收修改了其他游戏的租约");
+		require(!(co_await store.finish(*beta, true, "", 0, worker.maxAttempts)), "未回收的过期租约仍可确认");
+		require((co_await store.recover(worker, {"storage-beta"})) == 1, "第二款游戏无法独立回收");
+		for (const auto* gameId : {"storage-alpha", "storage-beta"})
+		{
+			auto replacement = co_await store.claim(worker, gameId);
+			require(replacement && replacement->attempts == 2, "范围回收后尝试次数不正确");
+			require(co_await store.finish(*replacement, true, "", 0, worker.maxAttempts), "范围回收后无法确认");
+		}
+	}
+
+	struct RecoveryCompletion
+	{
+		bool done = false;
+		std::uint64_t count = 0;
+		std::exception_ptr error;
+	};
+
+	gamehub::Awaitable<void> awaitRecoveryCompletion(std::shared_ptr<RecoveryCompletion> completion)
+	{
+		boost::asio::steady_timer pause(co_await boost::asio::this_coro::executor);
+		while (!completion->done)
+		{
+			pause.expires_after(std::chrono::milliseconds(5));
+			co_await pause.async_wait(boost::asio::use_awaitable);
+		}
+	}
+
+	gamehub::Awaitable<bool> taskAvailableNowait(gamehub::DbSession& session, std::string taskId)
+	{
+		co_await session.query("START TRANSACTION");
+		bool available = true;
+		std::exception_ptr failure;
+		try
+		{
+			std::vector<std::string> key {std::move(taskId)};
+			co_await session.query("SELECT id FROM delivery_task WHERE id=? FOR UPDATE NOWAIT", std::move(key));
+		}
+		catch (const boost::system::system_error& error)
+		{
+			const boost::system::error_code locked {boost::mysql::mysql_server_errc::er_lock_nowait,
+													boost::mysql::get_mysql_server_category()};
+			if (error.code() == locked)
+			{
+				available = false;
+			}
+			else
+			{
+				failure = std::current_exception();
+			}
+		}
+		co_await session.query("ROLLBACK");
+		if (failure)
+		{
+			std::rethrow_exception(failure);
+		}
+		co_return available;
+	}
+
+	gamehub::Awaitable<void> verifyRecoveryLockWindow(gamehub::DbSession& observer,
+													  const boost::mysql::results& bounds,
+													  std::shared_ptr<RecoveryCompletion> completion)
+	{
+		auto executor = co_await boost::asio::this_coro::executor;
+		const std::string firstId(bounds.rows()[0][0].as_string());
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		for (;;)
+		{
+			// 计数触发器使用迁移账号身份；临时测试实例在本子进程期间授权 PROCESS，只返回布尔值。
+			// UPDATE 已开始且被计数门闩阻塞，说明领取 SELECT 已结束，此后探测不会干扰 SKIP LOCKED。
+			auto updating = co_await observer.query(
+				"SELECT IF(EXISTS(SELECT 1 FROM information_schema.PROCESSLIST WHERE DB=DATABASE() "
+				"AND ID<>CONNECTION_ID() AND INFO LIKE 'UPDATE delivery_task_counts SET %'),'yes','no')");
+			if (updating.rows()[0][0].as_string() == "yes")
+			{
+				break;
+			}
+			require(!completion->done && std::chrono::steady_clock::now() < deadline, "回收未在计数门闩前开始更新任务");
+			boost::asio::steady_timer pause(executor, std::chrono::milliseconds(5));
+			co_await pause.async_wait(boost::asio::use_awaitable);
+		}
+		require(!(co_await taskAvailableNowait(observer, firstId)), "回收更新时未持有选中任务的锁");
+		for (auto row : bounds.rows())
+		{
+			require(co_await taskAvailableNowait(observer, std::string(row[1].as_string())),
+					"回收在提交前锁住了批次外任务");
+		}
+	}
+
+	gamehub::Awaitable<std::uint64_t> recoverWithLockProbe(std::shared_ptr<gamehub::Database> database,
+														   gamehub::Store& store,
+														   const gamehub::WorkerConfig& worker,
+														   bool cancel)
+	{
+		using namespace gamehub;
+		auto executor = co_await boost::asio::this_coro::executor;
+		auto completion = std::make_shared<RecoveryCompletion>();
+		boost::asio::cancellation_signal cancellation;
+		std::exception_ptr failure;
+		{
+			auto gate = co_await database->acquire();
+			auto bounds = co_await gate.query(
+				"SELECT CAST(MIN(id) AS CHAR),CAST(MAX(id) AS CHAR) FROM delivery_task "
+				"WHERE game_id IN ('storage-batch-alpha','storage-batch-beta') GROUP BY game_id ORDER BY game_id");
+			const std::string firstId(bounds.rows()[0][0].as_string());
+			co_await gate.query("START TRANSACTION");
+			std::vector<std::string> key {firstId};
+			co_await gate.query("SELECT bucket_id FROM delivery_task_counts WHERE bucket_id=MOD(?,64) FOR UPDATE",
+								std::move(key));
+			const auto completed = [completion](std::exception_ptr error, std::uint64_t count)
+			{
+				completion->error = error;
+				completion->count = count;
+				completion->done = true;
+			};
+			std::vector<std::string> games {"storage-batch-alpha", "storage-batch-beta"};
+			boost::asio::co_spawn(executor,
+								  store.recover(worker, games),
+								  boost::asio::bind_cancellation_slot(cancellation.slot(), completed));
+			try
+			{
+				auto observer = co_await database->acquire();
+				co_await verifyRecoveryLockWindow(observer, bounds, completion);
+				if (cancel)
+				{
+					cancellation.emit(boost::asio::cancellation_type::terminal);
+					co_await awaitRecoveryCompletion(completion);
+				}
+				co_await gate.query("ROLLBACK");
+			}
+			catch (...)
+			{
+				failure = std::current_exception();
+			}
+		}
+		// 异常也先释放计数门闩，再等子协程退出，worker 和 Store 的父帧始终存活。
+		co_await boost::asio::this_coro::reset_cancellation_state(boost::asio::disable_cancellation());
+		co_await awaitRecoveryCompletion(completion);
+		co_await boost::asio::this_coro::reset_cancellation_state();
+		if (failure)
+		{
+			std::rethrow_exception(failure);
+		}
+		if (completion->error)
+		{
+			std::rethrow_exception(completion->error);
+		}
+		co_return completion->count;
+	}
+
+	gamehub::Awaitable<void> verifyRecoveryBatchState(std::shared_ptr<gamehub::Database> database,
+													  gamehub::Store& store,
+													  unsigned pending)
+	{
+		using namespace gamehub;
+		constexpr unsigned kTasksPerGame = 120;
+		for (const auto* gameId : {"storage-batch-alpha", "storage-batch-beta"})
+		{
+			const auto counts = co_await store.stats(gameId);
+			require(counts.at("pending").to_number<unsigned>() == pending
+						&& counts.at("delivering").to_number<unsigned>() == kTasksPerGame - pending,
+					"分游戏回收未平均分配批次或修改了批次外任务");
+		}
+		const auto outside = co_await store.stats("storage-batch-outside");
+		require(outside.at("delivering").to_number<unsigned>() == 1 && outside.at("pending").to_number<unsigned>() == 0,
+				"分游戏回收修改了负责范围外任务");
+		auto session = co_await database->acquire();
+		auto generation =
+			co_await session.query("SELECT IF(COUNT(*)=0,'valid','invalid') FROM delivery_task WHERE game_id IN "
+								   "('storage-batch-alpha','storage-batch-beta','storage-batch-outside') "
+								   "AND ((status=0 AND generation<>8) OR (status=1 AND generation<>7) OR attempts<>1)");
+		require(generation.rows()[0][0].as_string() == "valid", "回收重复递增了代次或修改了批次外代次、尝试次数");
+	}
+
+	gamehub::Awaitable<void> verifyScopedRecoveryBatches(std::shared_ptr<gamehub::Database> database,
+														 gamehub::Store& store,
+														 gamehub::WorkerConfig worker)
+	{
+		using namespace gamehub;
+		constexpr unsigned kTasksPerGame = 120;
+		worker.maxAttempts = 2;
+		Submission input {"storage-batch-alpha", "announce", "storage", "scoped-batch", "{}", "", {}, "storage-test"};
+		input.fingerprint = sha256(input.payload);
+		for (unsigned serverId = 1; serverId <= kTasksPerGame; ++serverId)
+		{
+			input.servers.push_back(serverId);
+		}
+		co_await store.accept(input);
+		input.gameId = "storage-batch-beta";
+		co_await store.accept(input);
+		input.gameId = "storage-batch-outside";
+		input.servers = {1};
+		co_await store.accept(input);
+		{
+			auto session = co_await database->acquire();
+			// 合成进程崩溃后的持久化租约，不逐条领取，避免放大集成测试的数据库往返。
+			co_await session.query(
+				"UPDATE delivery_task SET status=1,attempts=1,generation=7,"
+				"lease_until=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6)) "
+				"WHERE game_id IN ('storage-batch-alpha','storage-batch-beta','storage-batch-outside')");
+		}
+		const std::vector<std::string> games {"storage-batch-alpha", "storage-batch-beta"};
+		const auto countsBeforeCancel = co_await store.stats();
+		bool cancelled = false;
+		try
+		{
+			co_await recoverWithLockProbe(database, store, worker, true);
+		}
+		catch (const boost::system::system_error& error)
+		{
+			cancelled = error.code() == boost::asio::error::operation_aborted;
+		}
+		require(cancelled, "计数更新前取消回收未返回取消错误");
+		co_await verifyRecoveryBatchState(database, store, 0);
+		require((co_await store.stats()) == countsBeforeCancel, "取消回收未恢复全局事务计数");
+		require((co_await recoverWithLockProbe(database, store, worker, false)) == 100, "多游戏回收首批未满足总额上限");
+		co_await verifyRecoveryBatchState(database, store, 50);
+		require((co_await store.recover(worker, games)) == 100, "多游戏回收第二批未满足总额上限");
+		co_await verifyRecoveryBatchState(database, store, 100);
+		require((co_await store.recover(worker, games)) == 40, "多游戏回收未处理剩余任务");
+		co_await verifyRecoveryBatchState(database, store, kTasksPerGame);
+		require((co_await store.recover(worker, games)) == 0, "回收修改了已经回收的任务");
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("DELETE FROM delivery_task WHERE game_id IN "
+								   "('storage-batch-alpha','storage-batch-beta','storage-batch-outside')");
+		}
+	}
+
+	gamehub::Awaitable<void> verifyGameCounts(std::shared_ptr<gamehub::Database> database, gamehub::Store& store)
+	{
+		using namespace gamehub;
+		const auto before = co_await store.stats("storage-alpha");
+		Submission
+			input {"storage-alpha", "announce", "storage", "game-count-rollback", "{}", "", {1, 1}, "storage-test"};
+		input.fingerprint = sha256(input.payload);
+		bool failed = false;
+		try
+		{
+			co_await store.accept(input);
+		}
+		catch (const boost::system::system_error& error)
+		{
+			failed = error.code() == boost::mysql::common_server_errc::er_dup_entry;
+		}
+		require(failed && (co_await store.stats("storage-alpha")) == before, "受理回滚未恢复按游戏事务计数");
+		{
+			auto session = co_await database->acquire();
+			co_await session.query(
+				"UPDATE delivery_task SET updated_at=TIMESTAMPADD(DAY,-3,UTC_TIMESTAMP(6)) WHERE game_id='storage-alpha'");
+		}
+		const auto beta = co_await store.stats("storage-beta");
+		const auto archived = co_await store.archiveDone("storage-alpha", 1, kMaxMaintenanceBatch, "storage-test");
+		const auto after = co_await store.stats("storage-alpha");
+		require(archived == before.at("done").to_number<std::uint64_t>() && after.at("done").to_number<unsigned>() == 0
+					&& after.at("archivedDone").to_number<std::uint64_t>() == archived
+					&& after.at("completedTotal") == before.at("completedTotal"),
+				"归档改变了按游戏完成总数");
+		require((co_await store.stats("storage-beta")) == beta, "归档污染其他游戏计数");
+		const auto empty = co_await store.stats("storage-empty");
+		require(empty.at("pending").to_number<unsigned>() == 0 && empty.at("completedTotal").to_number<unsigned>() == 0,
+				"无任务游戏统计未返回零值");
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("DELETE FROM delivery_task WHERE game_id IN ('storage-alpha','storage-beta')");
+			co_await session.query(
+				"DELETE FROM delivery_task_archive WHERE game_id IN ('storage-alpha','storage-beta')");
+		}
+		require((co_await store.stats("storage-alpha")).at("completedTotal").to_number<unsigned>() == 0
+					&& (co_await store.stats("storage-beta")).at("completedTotal").to_number<unsigned>() == 0,
+				"删除任务或归档后按游戏计数未归零");
+	}
+
 	gamehub::Awaitable<void> verifyCancelledSession(gamehub::Config config)
 	{
 		using namespace gamehub;
@@ -402,6 +779,10 @@ namespace
 		co_await verifyRecoverySkipsActiveLocks(database, store, worker);
 		co_await verifyArchiveSkipsUnselectedLocks(database, store, worker);
 		co_await verifyNonDeadlockIsNotRetried(database, store, worker);
+		co_await verifyScopedClaims(store, worker);
+		co_await verifyScopedRecovery(database, store, worker);
+		co_await verifyScopedRecoveryBatches(database, store, worker);
+		co_await verifyGameCounts(database, store);
 		co_await verifyCancelledSession(std::move(config));
 	}
 } // namespace

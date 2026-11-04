@@ -13,6 +13,7 @@
     "maxConnections": 8
   },
   "worker": {
+    "games": [],
     "pollMs": 1000,
     "concurrency": 4,
     "leaseSeconds": 60,
@@ -32,8 +33,20 @@
     {
       "id": "demo",
       "adapter": "demo-hmac-v1",
-      "callbackSecretEnv": "GAMEHUB_DEMO_CALLBACK_SECRET",
       "outboundSecretEnv": "GAMEHUB_DEMO_OUTBOUND_SECRET",
+      "deliveryEnabled": true,
+      "maxConcurrentDeliveries": 0,
+      "maxConcurrentPerServer": 0,
+      "callbackRatePerSecond": 100,
+      "callbackBurst": 200,
+      "channels": [
+        {
+          "id": "demo",
+          "adapter": "demo-hmac-v1",
+          "namespace": "demo",
+          "secretEnv": "GAMEHUB_DEMO_CALLBACK_SECRET"
+        }
+      ],
       "servers": [
         {
           "id": 1,

@@ -3,6 +3,7 @@
  */
 #include "core/Config.h"
 #include "core/Domain.h"
+#include "bootstrap/AdapterCatalog.h"
 #include "service/Application.h"
 #include <core/Log.h>
 #include <memory>
@@ -24,12 +25,13 @@ int main(int argc, char** argv)
 			return argc == 2 && std::string_view(argv[1]) == "--help" ? 0 : 2;
 		}
 		auto config = gamehub::loadConfig(argv[2]);
+		auto registry = gamehub::createBuiltinCatalog().buildRegistry(config);
 		if (argc == 4)
 		{
 			HICAL_LOG_INFO("配置和环境变量检查通过");
 			return 0;
 		}
-		std::make_shared<gamehub::Application>(std::move(config))->run();
+		std::make_shared<gamehub::Application>(std::move(config), std::move(registry))->run();
 		return 0;
 	}
 	catch (const gamehub::ConfigError& error)

@@ -15,6 +15,11 @@ namespace gamehub
 {
 	namespace
 	{
+		constexpr std::size_t kMaxGameIdLength = 32;
+		constexpr std::size_t kMaxExcludedServers = 1000;
+		constexpr std::size_t kMaxScopedGames = 100;
+		constexpr std::size_t kRecoveryBatchSize = 100;
+
 		std::uint64_t number(boost::mysql::field_view value)
 		{
 			return value.is_uint64() ? value.as_uint64() : static_cast<std::uint64_t>(value.as_int64());
@@ -100,18 +105,20 @@ namespace gamehub
 	{
 		auto session = co_await database_->acquire();
 		auto result = co_await session.query("SELECT MAX(version) FROM schema_version");
-		constexpr std::uint64_t kSchemaVersion = 2;
+		constexpr std::uint64_t kSchemaVersion = 3;
 		if (result.rows().empty() || result.rows()[0][0].is_null() || number(result.rows()[0][0]) != kSchemaVersion)
 		{
-			throw std::runtime_error("数据库迁移版本不匹配，当前程序要求版本 2");
+			throw std::runtime_error("数据库迁移版本不匹配，当前程序要求版本 3");
 		}
 		co_await session.query("SELECT e.id,t.generation,c.version,a.id FROM hub_event e "
 							   "LEFT JOIN delivery_task t ON t.event_id=e.id "
 							   "LEFT JOIN config_head c ON c.game_id=e.game_id "
 							   "LEFT JOIN audit_log a ON a.target_id=e.id LIMIT 0");
 		co_await session.query("SELECT bucket_id,archived_count FROM delivery_task_counts LIMIT 0");
-		co_await session.query("SELECT id,payload_redacted_at FROM hub_event LIMIT 0");
+		co_await session.query(
+			"SELECT id,payload_redacted_at,payload_version,fingerprint_version FROM hub_event LIMIT 0");
 		co_await session.query("SELECT id FROM delivery_task_archive LIMIT 0");
+		co_await session.query("SELECT game_id,bucket_id,pending_count FROM game_delivery_task_counts LIMIT 0");
 	}
 
 	Awaitable<void> Store::audit(DbSession& session,
@@ -131,6 +138,11 @@ namespace gamehub
 
 	Awaitable<AcceptResult> Store::insertEvent(DbSession& session, const Submission& submission)
 	{
+		if (submission.payloadVersion == 0 || submission.payloadVersion > kMaxContractVersion
+			|| submission.fingerprintVersion == 0 || submission.fingerprintVersion > kMaxContractVersion)
+		{
+			throw ApiError(400, "业务载荷或摘要版本无效");
+		}
 		bool duplicate = false;
 		std::uint64_t id = 0;
 		std::vector<std::string> params {submission.gameId,
@@ -138,12 +150,14 @@ namespace gamehub
 										 submission.nameSpace,
 										 submission.bizKey,
 										 submission.fingerprint,
-										 submission.payload};
+										 submission.payload,
+										 std::to_string(submission.payloadVersion),
+										 std::to_string(submission.fingerprintVersion)};
 		try
 		{
 			auto result = co_await session.query(
-				"INSERT INTO hub_event(game_id,task_type,namespace_key,biz_key,request_hash,payload,created_at) "
-				"VALUES(?,?,?,?,?,?,UTC_TIMESTAMP(6))",
+				"INSERT INTO hub_event(game_id,task_type,namespace_key,biz_key,request_hash,payload,payload_version,"
+				"fingerprint_version,created_at) VALUES(?,?,?,?,?,?,?,?,UTC_TIMESTAMP(6))",
 				std::move(params));
 			id = result.last_insert_id();
 		}
@@ -163,11 +177,13 @@ namespace gamehub
 										   submission.bizKey};
 			// 事件提交后不再修改。重复 INSERT 已拿到共享记录锁，这里不再申请排他锁。
 			// accept 到这里还没做过快照读；配置发布则先用 config_head 的行锁排队。
-			auto result =
-				co_await session.query("SELECT id,request_hash FROM hub_event WHERE game_id=? AND task_type=? "
-									   "AND namespace_key=? AND biz_key=?",
-									   std::move(keys));
-			if (result.rows().empty() || text(result.rows()[0][1]) != submission.fingerprint)
+			auto result = co_await session.query(
+				"SELECT id,request_hash,payload_version,fingerprint_version FROM hub_event WHERE game_id=? AND task_type=? "
+				"AND namespace_key=? AND biz_key=?",
+				std::move(keys));
+			if (result.rows().empty() || text(result.rows()[0][1]) != submission.fingerprint
+				|| number(result.rows()[0][2]) != submission.payloadVersion
+				|| number(result.rows()[0][3]) != submission.fingerprintVersion)
 			{
 				throw ApiError(409, "相同业务键的内容不一致");
 			}
@@ -218,22 +234,57 @@ namespace gamehub
 
 	Awaitable<std::optional<DeliveryTask>> Store::claim(const WorkerConfig& config)
 	{
-		co_return co_await retryDeadlockedTransaction<std::optional<DeliveryTask>>("claim",
-																				   [this, &config]()
-																				   {
-																					   return claimOnce(config);
-																				   });
+		co_return co_await retryDeadlockedTransaction<std::optional<DeliveryTask>>(
+			"claim",
+			[this, &config]()
+			{
+				return claimOnce(config, std::nullopt, {});
+			});
 	}
 
-	Awaitable<std::optional<DeliveryTask>> Store::claimOnce(const WorkerConfig& config)
+	Awaitable<std::optional<DeliveryTask>> Store::claim(const WorkerConfig& config,
+														std::string gameId,
+														std::vector<std::uint32_t> excludedServers)
+	{
+		if (!validKey(gameId, kMaxGameIdLength) || excludedServers.size() > kMaxExcludedServers)
+		{
+			throw std::invalid_argument("领取游戏或排除目标范围无效");
+		}
+		co_return co_await retryDeadlockedTransaction<std::optional<DeliveryTask>>(
+			"claim",
+			[this, &config, &gameId, &excludedServers]()
+			{
+				return claimOnce(config, gameId, excludedServers);
+			});
+	}
+
+	Awaitable<std::optional<DeliveryTask>> Store::claimOnce(const WorkerConfig& config,
+															std::optional<std::string> gameId,
+															std::vector<std::uint32_t> excludedServers)
 	{
 		auto session = co_await database_->acquire();
 		co_await session.query("START TRANSACTION");
-		// 性能敏感：走 idx_pending，每次只处理一条到期任务，不按尝试次数扫描整条队列。
-		auto result =
-			co_await session.query("SELECT id,event_id,game_id,server_id,attempts,generation FROM delivery_task "
-								   "WHERE status=0 AND next_retry_at<=UTC_TIMESTAMP(6) "
-								   "ORDER BY next_retry_at,id LIMIT 1 FOR UPDATE SKIP LOCKED");
+		// 性能敏感：游戏范围沿 idx_game_pending 领取；满额目标在 SQL 中排除，不先领取再退回。
+		std::string sql = "SELECT id,event_id,game_id,server_id,attempts,generation FROM delivery_task ";
+		sql += gameId ? "FORCE INDEX(idx_game_pending) WHERE game_id=? AND " : "WHERE ";
+		sql += "status=0 AND next_retry_at<=UTC_TIMESTAMP(6) ";
+		std::vector<std::string> params;
+		if (gameId)
+		{
+			params.push_back(*gameId);
+		}
+		if (!excludedServers.empty())
+		{
+			sql += "AND server_id NOT IN (";
+			for (auto serverId : excludedServers)
+			{
+				sql += params.size() > (gameId ? 1U : 0U) ? ",?" : "?";
+				params.push_back(std::to_string(serverId));
+			}
+			sql += ") ";
+		}
+		sql += "ORDER BY next_retry_at,id LIMIT 1 FOR UPDATE SKIP LOCKED";
+		auto result = co_await session.query(std::move(sql), std::move(params));
 		if (result.rows().empty())
 		{
 			co_await session.query("COMMIT");
@@ -256,21 +307,17 @@ namespace gamehub
 		task.serverId = static_cast<std::uint32_t>(number(row[3]));
 		task.attempts = static_cast<unsigned>(number(row[4])) + 1;
 		task.generation = number(row[5]) + 1;
-		std::vector<std::string> eventKey {std::to_string(number(row[1]))};
-		auto event = co_await session.query("SELECT task_type,namespace_key,biz_key,payload FROM hub_event WHERE id=?",
-											std::move(eventKey));
+		task.eventId = number(row[1]);
+		std::vector<std::string> eventKey {std::to_string(task.eventId)};
+		auto event = co_await session.query(
+			"SELECT task_type,namespace_key,biz_key,payload,payload_version,fingerprint_version FROM hub_event WHERE id=?",
+			std::move(eventKey));
 		task.taskType = text(event.rows()[0][0]);
-		// namespace 和业务键分开传给接收端，拼成一个字符串会有歧义。
-		auto envelope = boost::json::object {{"taskId", std::to_string(task.id)},
-											 {"eventId", std::to_string(number(row[1]))},
-											 {"gameId", task.gameId},
-											 {"serverId", task.serverId},
-											 {"taskType", task.taskType},
-											 {"namespace", text(event.rows()[0][1])},
-											 {"bizKey", text(event.rows()[0][2])},
-											 {"payload", boost::json::parse(text(event.rows()[0][3]))}};
+		task.nameSpace = text(event.rows()[0][1]);
 		task.bizKey = text(event.rows()[0][2]);
-		task.payload = boost::json::serialize(envelope);
+		task.payload = text(event.rows()[0][3]);
+		task.payloadVersion = static_cast<unsigned>(number(event.rows()[0][4]));
+		task.fingerprintVersion = static_cast<unsigned>(number(event.rows()[0][5]));
 		std::vector<std::string> update {std::to_string(config.leaseSeconds), std::to_string(task.id)};
 		co_await session.query(
 			"UPDATE delivery_task SET status=1,attempts=attempts+1,generation=generation+1,"
@@ -285,19 +332,71 @@ namespace gamehub
 		co_return co_await retryDeadlockedTransaction<std::uint64_t>("recover",
 																	 [this, &config]()
 																	 {
-																		 return recoverOnce(config);
+																		 return recoverOnce(config, {});
 																	 });
 	}
 
-	Awaitable<std::uint64_t> Store::recoverOnce(const WorkerConfig& config)
+	Awaitable<std::uint64_t> Store::recover(const WorkerConfig& config, std::vector<std::string> gameIds)
+	{
+		if (gameIds.empty())
+		{
+			co_return 0;
+		}
+		if (gameIds.size() > kMaxScopedGames)
+		{
+			throw std::invalid_argument("回收游戏范围过大");
+		}
+		for (const auto& gameId : gameIds)
+		{
+			if (!validKey(gameId, kMaxGameIdLength))
+			{
+				throw std::invalid_argument("回收游戏标识无效");
+			}
+		}
+		co_return co_await retryDeadlockedTransaction<std::uint64_t>("recover",
+																	 [this, &config, &gameIds]()
+																	 {
+																		 return recoverOnce(config, gameIds);
+																	 });
+	}
+
+	Awaitable<std::uint64_t> Store::recoverOnce(const WorkerConfig& config, std::vector<std::string> gameIds)
 	{
 		auto session = co_await database_->acquire();
 		co_await session.query("START TRANSACTION");
-		// 范围 UPDATE 会先锁二级索引再等主键，可能与按主键确认的 finish 互锁。
-		// 先跳过正在确认的行，只更新本事务已经锁定的过期任务。
-		auto selected =
-			co_await session.query("SELECT id FROM delivery_task WHERE status=1 AND lease_until<=UTC_TIMESTAMP(6) "
-								   "ORDER BY lease_until,id LIMIT 100 FOR UPDATE SKIP LOCKED");
+		// 先跳过正在确认的行，只更新本事务已经锁定的过期任务，保持 finish 的主键锁顺序。
+		std::string sql;
+		if (gameIds.empty())
+		{
+			sql = "SELECT id FROM delivery_task WHERE status=1 AND lease_until<=UTC_TIMESTAMP(6) "
+				  "ORDER BY lease_until,id LIMIT "
+				  + std::to_string(kRecoveryBatchSize) + " FOR UPDATE SKIP LOCKED";
+		}
+		else
+		{
+			// 每个分支固定一个 game_id，沿游戏租约索引有序取数；多游戏 IN 后全局排序会锁住整个积压。
+			// 各游戏预分配总计 100 条配额，避免前一游戏持续积压时后续游戏一直不能回收。
+			for (std::size_t i = 0; i < gameIds.size(); ++i)
+			{
+				if (i != 0)
+				{
+					sql += " UNION ALL ";
+				}
+				const auto quota = kRecoveryBatchSize / gameIds.size() + (i < kRecoveryBatchSize % gameIds.size());
+				if (gameIds.size() > 1)
+				{
+					sql += '(';
+				}
+				sql += "SELECT id FROM delivery_task FORCE INDEX(idx_game_lease) WHERE game_id=? "
+					   "AND status=1 AND lease_until<=UTC_TIMESTAMP(6) ORDER BY lease_until,id LIMIT "
+					   + std::to_string(quota) + " FOR UPDATE SKIP LOCKED";
+				if (gameIds.size() > 1)
+				{
+					sql += ')';
+				}
+			}
+		}
+		auto selected = co_await session.query(std::move(sql), gameIds);
 		if (selected.rows().empty())
 		{
 			co_await session.query("COMMIT");
@@ -430,6 +529,34 @@ namespace gamehub
 			"CAST(SUM(archived_count) AS UNSIGNED),"
 			"(SELECT GREATEST(0,COALESCE(TIMESTAMPDIFF(SECOND,MIN(created_at),UTC_TIMESTAMP(6)),0)) "
 			"FROM delivery_task FORCE INDEX(idx_status_created) WHERE status=0) FROM delivery_task_counts");
+		const auto row = result.rows()[0];
+		co_return boost::json::object {{"pending", number(row[0])},
+									   {"delivering", number(row[1])},
+									   {"done", number(row[2])},
+									   {"failed", number(row[3])},
+									   {"archivedDone", number(row[4])},
+									   {"completedTotal", number(row[2]) + number(row[4])},
+									   {"oldestPendingSeconds", number(row[5])}};
+	}
+
+	Awaitable<boost::json::object> Store::stats(std::string gameId)
+	{
+		if (!validKey(gameId, kMaxGameIdLength))
+		{
+			throw std::invalid_argument("统计游戏标识无效");
+		}
+		auto session = co_await database_->acquire();
+		// 性能敏感：每款游戏最多 64 行计数，最老 pending 使用游戏范围索引，不扫描历史任务。
+		std::vector<std::string> params {gameId, gameId};
+		auto result = co_await session.query(
+			"SELECT CAST(COALESCE(SUM(pending_count),0) AS UNSIGNED),"
+			"CAST(COALESCE(SUM(delivering_count),0) AS UNSIGNED),"
+			"CAST(COALESCE(SUM(done_count),0) AS UNSIGNED),CAST(COALESCE(SUM(failed_count),0) AS UNSIGNED),"
+			"CAST(COALESCE(SUM(archived_count),0) AS UNSIGNED),"
+			"(SELECT GREATEST(0,COALESCE(TIMESTAMPDIFF(SECOND,MIN(created_at),UTC_TIMESTAMP(6)),0)) "
+			"FROM delivery_task FORCE INDEX(idx_game_status_created) WHERE game_id=? AND status=0) "
+			"FROM game_delivery_task_counts WHERE game_id=?",
+			std::move(params));
 		const auto row = result.rows()[0];
 		co_return boost::json::object {{"pending", number(row[0])},
 									   {"delivering", number(row[1])},

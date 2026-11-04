@@ -30,11 +30,19 @@ namespace gamehub
 		Awaitable<void> checkSchema();
 		/// @param submission 检查通过的业务数据。@return 同一事务内保存事件和任务的结果；同键不同内容时抛 409。
 		Awaitable<AcceptResult> accept(Submission submission);
-		/// @param config 租约和重试上限；每次最多处理一条到期 pending。
+		/// @param config 租约和重试上限；兼容全局领取入口，应用投递必须使用带 gameId 的重载。
 		/// @return 已提交领取事务的任务；没有到期任务，或选中的任务已用完重试次数、转为 failed 时返回空。
 		Awaitable<std::optional<DeliveryTask>> claim(const WorkerConfig& config);
-		/// @param config 重试上限。@return 回收的过期任务数，每次最多处理 100 条。
+		/// @param config 租约和重试上限；gameId 必须为明确的游戏；excludedServers 是本进程已满额的目标。
+		/// @return 仅属于该游戏且目标未被排除的已提交领取任务；无候选时返回空。
+		Awaitable<std::optional<DeliveryTask>> claim(const WorkerConfig& config,
+													 std::string gameId,
+													 std::vector<std::uint32_t> excludedServers = {});
+		/// @param config 重试上限。@return 全局回收过期任务数，最多 100 条；分游戏部署必须使用带范围的重载。
 		Awaitable<std::uint64_t> recover(const WorkerConfig& config);
+		/// @param config 重试上限；gameIds 为本进程负责的游戏范围，空范围不回收任何任务。
+		/// @return 范围内已回收过期任务数。总额 100 按游戏均分，余数依列表顺序分配，空闲游戏的名额不借用。
+		Awaitable<std::uint64_t> recover(const WorkerConfig& config, std::vector<std::string> gameIds);
 		/// @param task 领取的任务；success 是否收到业务确认；error 固定错误类别；delay 重试间隔秒数；maxAttempts 重试上限。
 		/// @return 是否持有有效租约并更新成功；旧代次或租约过期时不能更新。
 		Awaitable<bool> finish(const DeliveryTask& task,
@@ -50,6 +58,8 @@ namespace gamehub
 		Awaitable<bool> replay(std::string gameId, std::uint64_t taskId, std::string actor);
 		/// @return 当前各状态、归档数量和最老 pending 的等待时间；只汇总固定数量的计数行。
 		Awaitable<boost::json::object> stats();
+		/// @param gameId 游戏标识。@return 该游戏的状态计数与最老积压，最多汇总 64 个计数分片。
+		Awaitable<boost::json::object> stats(std::string gameId);
 		/// @param gameId 游戏；keepDays 保留天数；batchSize 单批上限；actor 操作者。
 		/// @return 本次原子移入归档表的 done 任务数；幂等事件和审计记录保留。
 		Awaitable<std::uint64_t> archiveDone(std::string gameId,
@@ -72,8 +82,10 @@ namespace gamehub
 	private:
 		// 每次调用拥有独立会话；仅外层入口按完整事务重试 1213，参数不会跨尝试被移空。
 		Awaitable<AcceptResult> acceptOnce(Submission submission);
-		Awaitable<std::optional<DeliveryTask>> claimOnce(const WorkerConfig& config);
-		Awaitable<std::uint64_t> recoverOnce(const WorkerConfig& config);
+		Awaitable<std::optional<DeliveryTask>> claimOnce(const WorkerConfig& config,
+														 std::optional<std::string> gameId,
+														 std::vector<std::uint32_t> excludedServers);
+		Awaitable<std::uint64_t> recoverOnce(const WorkerConfig& config, std::vector<std::string> gameIds);
 		Awaitable<bool> finishOnce(const DeliveryTask& task,
 								   bool success,
 								   std::string error,

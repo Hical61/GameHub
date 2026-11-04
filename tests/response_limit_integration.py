@@ -8,7 +8,6 @@ from pathlib import Path
 import subprocess
 import threading
 import time
-from unittest.mock import patch
 
 import integration
 from demo_receiver import signature
@@ -183,8 +182,7 @@ def main():
     parser.add_argument("--mysql-bin", type=Path, required=True)
     args = parser.parse_args()
     fixture = integration.Fixture(args.binary, args.mysql_bin)
-    with patch.object(integration, "verify", verify_response_limits):
-        integration.run_fixture(fixture)
+    integration.run_fixture(fixture, verifier=verify_response_limits)
 
 
 if __name__ == "__main__":

@@ -93,7 +93,7 @@ jobs:
         id: mysql
         timeout-minutes: 10
         run: python scripts/setup-test-mysql.py --github-output "$env:GITHUB_OUTPUT"
-      - name: MySQL 完整故障集成
+      - name: MySQL 完整故障与多游戏隔离集成
         id: integration
         timeout-minutes: 15
         env:

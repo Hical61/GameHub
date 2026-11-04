@@ -2,6 +2,7 @@
  * @brief 服务配置、游戏和区服地址。
  */
 #pragma once
+#include <boost/json.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <stdexcept>
@@ -28,12 +29,29 @@ namespace gamehub
 		std::string target;
 	};
 
+	struct ChannelConfig
+	{
+		std::string id;
+		std::string adapter;
+		std::string nameSpace;
+		std::string secret;
+		boost::json::object options;
+	};
+
 	struct GameConfig
 	{
 		std::string id;
 		std::string callbackSecret;
 		std::string outboundSecret;
 		std::vector<ServerEndpoint> servers;
+		std::string adapter = "demo-hmac-v1";
+		std::vector<ChannelConfig> channels;
+		bool deliveryEnabled = true;
+		unsigned maxConcurrentDeliveries = 0;
+		unsigned maxConcurrentPerServer = 0;
+		unsigned callbackRatePerSecond = 100;
+		unsigned callbackBurst = 200;
+		boost::json::object options;
 		/// @param serverId 区服编号。@return 对应的目标地址；未配置时抛 ApiError。
 		const ServerEndpoint& endpoint(std::uint32_t serverId) const;
 	};
@@ -51,6 +69,8 @@ namespace gamehub
 		unsigned connectTimeoutMs = 2000;
 		unsigned requestTimeoutMs = 5000;
 		std::size_t maxResponseBodyBytes = kDefaultMaxResponseBodyBytes;
+		// 空列表表示处理全部配置游戏；非空时领取及回收均仅处理这些游戏。
+		std::vector<std::string> games;
 	};
 
 	struct Config
@@ -74,6 +94,6 @@ namespace gamehub
 		const GameConfig& game(std::string_view gameId) const;
 	};
 
-	/// @param path 标准 JSON 配置文件的路径。@return 检查通过的配置；密钥从环境变量读取，错误信息不带配置值。
+	/// @param path 标准 JSON 配置文件的路径。@return 通用结构检查通过的配置；协议专用检查由启动目录执行，密钥从环境变量读取。
 	Config loadConfig(const std::filesystem::path& path);
 } // namespace gamehub

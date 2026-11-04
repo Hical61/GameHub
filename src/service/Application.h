@@ -12,8 +12,9 @@ namespace gamehub
 	class Application : public std::enable_shared_from_this<Application>
 	{
 	public:
-		/// @param config 检查通过的完整配置。Application 实例必须由 shared_ptr 持有。
-		explicit Application(Config config);
+		/// @param config 检查通过的完整配置；registry 宿主已构造且与配置一致的适配注册表。
+		/// @brief Application 实例必须由 shared_ptr 持有；适配器由宿主组装，不依赖具体实现。
+		Application(Config config, GameRegistry registry);
 		/// @brief 注册路由和周期任务，然后阻塞运行服务；无返回值，启动失败时抛异常。
 		void run();
 
@@ -24,6 +25,7 @@ namespace gamehub
 		Awaitable<hical::HttpResponse> dispatch(const hical::HttpRequest& request);
 		Awaitable<hical::HttpResponse> callback(const hical::HttpRequest& request);
 		Awaitable<hical::HttpResponse> adminWrite(const hical::HttpRequest& request, const std::string& actor);
+		Awaitable<hical::HttpResponse> adminRead(const hical::HttpRequest& request);
 		Awaitable<hical::HttpResponse> archive(const hical::HttpRequest& request, std::string actor);
 		Awaitable<hical::HttpResponse> metrics();
 		std::string authenticateAdmin(const hical::HttpRequest& request, bool write) const;
@@ -34,6 +36,7 @@ namespace gamehub
 		Config config_;
 		hical::HttpServer server_;
 		GameRegistry registry_;
+		std::vector<std::string> recoveryGames_;
 		std::shared_ptr<Database> database_;
 		Store store_;
 		hical::HttpClientPool http_;

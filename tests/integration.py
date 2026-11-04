@@ -1,4 +1,4 @@
-"""启动临时 MySQL 和模拟游戏服，检查事务、HTTP 投递及故障恢复。"""
+"""在独立临时 MySQL 和模拟游戏服中检查故障恢复与多游戏隔离。"""
 import argparse
 import concurrent.futures
 from contextlib import closing
@@ -279,8 +279,14 @@ class Fixture:
         self.config.write_text(json.dumps(config), encoding="utf-8")
         self.check_configs(config)
         storage = self.binary.with_name("gamehub_storage_tests" + self.binary.suffix)
-        result = subprocess.run([str(storage), str(self.config)], capture_output=True, env=self.env,
-                                timeout=self.operation_timeout(30))
+        # 仅本次独立临时实例的存储测试需要观察 root definer 触发器内的连接。
+        # 退出存储测试后先撤销 PROCESS，再以原有四项 DML 权限启动 Hub。
+        self.sql("GRANT PROCESS ON *.* TO 'gamehub'@'localhost'")
+        try:
+            result = subprocess.run([str(storage), str(self.config)], capture_output=True, env=self.env,
+                                    timeout=self.operation_timeout(30))
+        finally:
+            self.sql("REVOKE PROCESS ON *.* FROM 'gamehub'@'localhost'")
         if result.returncode:
             print(result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace"))
             raise AssertionError("存储集成测试失败")
@@ -583,6 +589,53 @@ class Fixture:
                 raise RuntimeError("测试清理未全部完成")
 
 
+class MultiGameFixture(Fixture):
+    """复用完整建库和清理流程，在第一次启动前增加两款合成游戏。"""
+
+    def start_hub(self):
+        """首次追加合成游戏配置，以后重启沿用测试写入的范围与暂停设置。"""
+        if not getattr(self, "multi_configured", False):
+            config = json.loads(self.config.read_text(encoding="utf-8"))
+            config["worker"].update(concurrency=4, requestTimeoutMs=3000)
+            config["games"][0].update(maxConcurrentDeliveries=2, maxConcurrentPerServer=1)
+            for game_id, adapter in (("other", "demo-hmac-v1"), ("sample_beta", "demo-hmac-v1")):
+                receiver = DemoReceiver(("127.0.0.1", 0), self.path / f"{game_id}-receiver.db",
+                                        self.env["GAMEHUB_DEMO_OUTBOUND_SECRET"], game_id=game_id)
+                self._start_receiver(receiver)
+                game = {"id": game_id, "adapter": adapter,
+                        "callbackSecretEnv": "GAMEHUB_DEMO_CALLBACK_SECRET",
+                        "outboundSecretEnv": "GAMEHUB_DEMO_OUTBOUND_SECRET",
+                        "maxConcurrentDeliveries": 1, "maxConcurrentPerServer": 1,
+                        "servers": [{"id": 1, "host": "127.0.0.1", "port": receiver.server_port,
+                                     "target": "/internal/gamehub"}]}
+                if game_id == "other":
+                    game.update(callbackRatePerSecond=1, callbackBurst=10, channels=[
+                        {"id": "merchant_a", "adapter": "demo-hmac-v1", "namespace": "merchant_a",
+                         "secretEnv": "GAMEHUB_DEMO_CALLBACK_SECRET"},
+                        {"id": "merchant_b", "adapter": "demo-hmac-v1", "namespace": "merchant_b",
+                         "secretEnv": "GAMEHUB_DEMO_CALLBACK_SECRET"}])
+                config["games"].append(game)
+            # 多于单次领取检查预算的空游戏，验证轮转跨 tick 仍能到达有任务游戏。
+            for number in range(5):
+                idle = json.loads(json.dumps(config["games"][0]))
+                idle.update(id=f"idle_{number}", maxConcurrentDeliveries=1)
+                config["games"].insert(1, idle)
+            self.config.write_text(json.dumps(config), encoding="utf-8")
+            self.multi_configured = True
+        super().start_hub()
+
+    def configure_worker(self, games, enabled=True):
+        """停止本测试创建的 Hub，修改领取范围后重启；数据库和任务保留。"""
+        self.hub.terminate()
+        self.hub.wait(timeout=self.operation_timeout(10))
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        config["worker"]["games"] = games
+        config["games"][0]["deliveryEnabled"] = enabled
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+        self.start_hub()
+
+
+
 def order(key, server_id=1):
     return {"bizKey": key, "channelOrderId": key, "serverId": server_id, "playerId": "synthetic-player",
             "productId": "synthetic-product", "amountMinor": 100, "currency": "CNY"}
@@ -812,10 +865,100 @@ def verify(fixture):
     verify_retry_limit(f)
 
 
+def submitted(fixture, game_id, channel, key, server_id=1):
+    """提交合成订单，返回受理事件号；不包含真实账号或玩家资料。"""
+    body = order(key, server_id)
+    status, result = fixture.request("POST", f"/api/callback/{game_id}/{channel}", body, signed=True)
+    assert status == 200, f"合成通知受理失败：{game_id}，状态 {status}"
+    return result["eventId"]
+
+
+def verify_fair_delivery(fixture):
+    """慢区服前方有积压时，同游戏其他区服及其他游戏仍能完成。"""
+    pause = threading.Event()
+    receiver = fixture.receivers[0]
+    receiver.pause = pause
+    try:
+        slow = submitted(fixture, "demo", "demo", "multi-slow-0")
+        wait_for(lambda: receiver.requests > 0, "慢目标已占用一个投递名额")
+        for number in range(1, 5):
+            submitted(fixture, "demo", "demo", f"multi-slow-{number}")
+        same_game = submitted(fixture, "demo", "demo", "multi-fast-server", 2)
+        other_game = submitted(fixture, "other", "merchant_a", "multi-fast-game")
+        sample_beta = submitted(fixture, "sample_beta", "demo", "multi-sample-beta")
+        wait_for(lambda: all(fixture.tasks(event_id) == [2] for event_id in (same_game, other_game, sample_beta)),
+                 "慢目标期间其他目标与游戏完成", 2.5)
+        assert fixture.tasks(slow) == [1], "验证隔离时慢目标已经释放，测试没有覆盖并发路径"
+        status, runtime = fixture.request("GET", "/admin/runtime/demo", admin=fixture.admin(games=["demo"]))
+        assert status == 200 and runtime["inFlight"] == 1
+        assert runtime["maxConcurrentPerServer"] == 1
+        assert any(target["serverId"] == 1 and target["inFlight"] == 1 for target in runtime["targets"])
+    finally:
+        pause.set()
+        receiver.pause = None
+    wait_for(lambda: fixture.tasks(slow) == [2], "慢目标恢复后完成")
+    wait_for(lambda: fixture.request("GET", "/admin/stats/demo", admin=fixture.admin())[1]["pending"] == 0,
+             "慢目标积压全部清空")
+    print("通过：三款合成游戏轮转、慢区服并发隔离及通知投递")
+
+
+def verify_scopes(fixture):
+    """相同订单在独立商户下分别处理，同商户重复仍沿用原事件。"""
+    first = submitted(fixture, "other", "merchant_a", "multi-merchant")
+    second = submitted(fixture, "other", "merchant_b", "multi-merchant")
+    assert first != second
+    assert submitted(fixture, "other", "merchant_a", "multi-merchant") == first
+    wait_for(lambda: fixture.tasks(first) == [2] and fixture.tasks(second) == [2], "商户隔离订单完成")
+    with closing(sqlite3.connect(fixture.receivers[2].database)) as db:
+        assert db.execute("SELECT COUNT(*) FROM synthetic_ledger WHERE biz_key='multi-merchant'").fetchone()[0] == 2
+    viewer = fixture.admin(role="viewer", games=["other"])
+    status, counts = fixture.request("GET", "/admin/stats/other", admin=viewer)
+    assert status == 200 and counts["done"] >= 3
+    status, runtime = fixture.request("GET", "/admin/runtime/other", admin=viewer)
+    assert status == 200 and runtime["gameId"] == "other" and "games" not in runtime
+    for endpoint in ("/admin/stats", "/admin/stats/demo", "/admin/runtime", "/admin/runtime/demo"):
+        assert fixture.request("GET", endpoint, admin=viewer)[0] == 403
+    print("通过：多商户业务身份、持久防重和按游戏统计授权")
+
+
+def verify_worker_scope(fixture):
+    """修改进程领取范围不会消耗其他游戏任务的尝试次数；暂停同样生效。"""
+    fixture.configure_worker(["other"])
+    pending = submitted(fixture, "demo", "demo", "multi-scope-pending")
+    healthy = submitted(fixture, "other", "merchant_a", "multi-scope-other")
+    wait_for(lambda: fixture.tasks(healthy) == [2], "指定游戏范围继续投递")
+    assert fixture.sql(f"SELECT status,attempts FROM gamehub.delivery_task WHERE event_id={int(pending)}") == "0\t0"
+    fixture.configure_worker(["demo"], enabled=False)
+    snapshot = fixture.request("GET", "/admin/runtime/demo", admin=fixture.admin())[1]
+    assert not snapshot["enabled"]
+    assert fixture.sql(f"SELECT status,attempts FROM gamehub.delivery_task WHERE event_id={int(pending)}") == "0\t0"
+    fixture.configure_worker([])
+    wait_for(lambda: fixture.tasks(pending) == [2], "恢复游戏范围后原任务完成")
+    print("通过：进程领取范围、暂停与恢复不会误领其他游戏")
+
+
+def verify_callback_quota(fixture):
+    """一个游戏耗尽回调桶后，其他游戏的合法回调与管理接口仍可用。"""
+    fixture.callback_burst("/api/callback/other/merchant_a")
+    submitted(fixture, "demo", "demo", "multi-independent-quota")
+    assert fixture.request("GET", "/admin/runtime", admin=fixture.admin())[0] == 200
+    assert fixture.request("GET", "/admin/ready")[0] == 200
+    print("通过：按游戏入口配额不挤占其他游戏和管理接口")
+
+
+def verify_multi_game(fixture):
+    verify_fair_delivery(fixture)
+    verify_scopes(fixture)
+    verify_worker_scope(fixture)
+    verify_callback_quota(fixture)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--mysql-bin", type=Path, required=True)
+    parser.add_argument("--suite", choices=("core", "multi-game", "all"), default="all",
+                        help="选择基础故障、多游戏或全部用例，默认全部；每组使用独立临时实例")
     parser.add_argument("--timeout-seconds", type=float, default=600,
                         help="整轮测试总时限，默认 600 秒；到期后先取证再清理")
     parser.add_argument("--inject-failure", action="store_true",
@@ -823,12 +966,25 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
         parser.error("--timeout-seconds 必须是正数")
-    fixture = Fixture(args.binary, args.mysql_bin)
-    run_fixture(fixture, args.timeout_seconds, args.inject_failure)
+    run_suites(args.binary, args.mysql_bin, args.suite, args.timeout_seconds, args.inject_failure)
 
 
-def run_fixture(fixture, timeout_seconds=600, inject_failure=False):
-    """运行 fixture 并清理；有错误时保留诊断并重新抛出，无返回值。"""
+def run_suites(binary, mysql_bin, suite="all", timeout_seconds=600, inject_failure=False):
+    """按 suite 创建独立实例，共用 timeout_seconds 总预算；失败立即取证退出，无返回值。"""
+    suites = {"core": (Fixture, verify), "multi-game": (MultiGameFixture, verify_multi_game)}
+    selected = suites.values() if suite == "all" else (suites[suite],)
+    deadline = time.monotonic() + timeout_seconds
+    for fixture_type, verifier in selected:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise IntegrationDeadlineExceeded("集成测试超过总时限，后续用例未启动")
+        fixture = fixture_type(binary, mysql_bin)
+        run_fixture(fixture, remaining, inject_failure, verifier=verifier)
+    print("全部集成测试通过")
+
+
+def run_fixture(fixture, timeout_seconds=600, inject_failure=False, *, verifier=None):
+    """运行 fixture 后清理；verifier 默认使用基础验证，失败保留诊断并原样抛出，无返回值。"""
     try:
         with RunDeadline(timeout_seconds) as deadline:
             fixture.run_deadline = deadline
@@ -836,7 +992,7 @@ def run_fixture(fixture, timeout_seconds=600, inject_failure=False):
             deadline.timeout(timeout_seconds)
             if inject_failure:
                 raise AssertionError("人为触发失败，用于检查诊断和进程清理")
-            verify(fixture)
+            (verify if verifier is None else verifier)(fixture)
             deadline.timeout(timeout_seconds)
     except BaseException as failure:
         fixture.run_deadline = None
@@ -848,7 +1004,7 @@ def run_fixture(fixture, timeout_seconds=600, inject_failure=False):
     else:
         fixture.run_deadline = None
         fixture.close()
-        print("全部集成测试通过，临时数据已清理")
+        print("本组集成测试通过，临时数据已清理")
 
 
 if __name__ == "__main__":

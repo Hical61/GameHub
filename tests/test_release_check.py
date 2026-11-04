@@ -62,7 +62,10 @@ class ContentChecks(unittest.TestCase):
                     ".aws/credentials", ".ssh/config", "config/credentials.json", "config/secrets.yaml", "service-account.json",
                     ".netrc", ".git-credentials", "backups/gamehub.sql", "exports/players.csv", "data/raw/2026/players.json",
                     "gamehub-backup.sql", "players_export.csv", "config.json.bak", "config.json~",
-                    "tls/server.pem", "store.sqlite3-wal", "lib/libsample.so.1", "deps.zip")
+                    "tls/server.pem", "store.sqlite3-wal", "lib/libsample.so.1", "deps.zip",
+                    "docs/private.md", "docs/validation.md", "docs/nested/architecture.md", "docs/architecture.md.bak",
+                    "docs/Architecture.md", "docs/architecture.md", "docs/api.md", "docs/game-integration.md",
+                    "docs/operations.md", "docs/testing.md", "docs/design-notes.md")
         for path in rejected:
             with self.subTest(path=path):
                 self.assertTrue(CHECK.forbidden_path(path))
@@ -228,13 +231,20 @@ class GitChecks(unittest.TestCase):
     def test_ignored_link_and_force_added_artifact(self):
         self.write(".gitignore", ".local/\n")
         self.write(".local/private.md", "synthetic\n")
+        private_adapter = ".local/private-adapters/SyntheticAdapter.cpp"
+        self.write(private_adapter, "// 合成私有适配器。\n")
         self.write("README.md", "[local](.local/private.md)\n")
-        self.git("add", ".gitignore", "README.md")
+        self.git("add", ".")
+        staged = CHECK.git_paths(self.root, "ls-files", "--cached", "-z")
+        self.assertTrue({".local/private.md", private_adapter}.isdisjoint(staged))
         issues = CHECK.check_repository(self.root, all_files=True)
         self.assertIn(("README.md", 1, "本地链接目标未纳入发布文件"), issues)
-        self.git("add", "--force", ".local/private.md")
-        issues = CHECK.check_repository(self.root, all_files=True)
-        self.assertIn((".local/private.md", 1, "禁止发布的本地文件或产物"), issues)
+        self.git("add", "--force", ".local/private.md", private_adapter)
+        for all_files in (False, True):
+            with self.subTest(all_files=all_files):
+                issues = CHECK.check_repository(self.root, all_files=all_files)
+                for path in (".local/private.md", private_adapter):
+                    self.assertIn((path, 1, "禁止发布的本地文件或产物"), issues)
 
     def test_static_config_is_checked_in_index_not_only_worktree(self):
         secret = "synthetic-staged-password"
@@ -269,17 +279,31 @@ class GitChecks(unittest.TestCase):
             self.assertEqual(rejected, set(private))
 
     def test_docs_remain_local_and_force_add_is_rejected(self):
-        """普通暂存忽略被排除的文件；强制加入后，两种发布检查都必须拒绝。"""
-        self.write(".gitignore", "/docs/\n")
-        self.write("docs/private.md", "synthetic local notes\n")
+        """真实忽略规则排除全部本地文档；强制加入后，两种发布检查都必须拒绝。"""
+        self.write(".gitignore", (ROOT / ".gitignore").read_text(encoding="utf-8"))
+        private = {"docs/architecture.md", "docs/api.md", "docs/game-integration.md", "docs/operations.md",
+                   "docs/testing.md", "docs/design-notes.md", "docs/private.md", "docs/validation.md",
+                   "docs/development-plan.md", "docs/nested/architecture.md"}
+        for path in private:
+            self.write(path, "synthetic notes\n")
+        self.write("README.md", "synthetic public readme\n")
         self.git("add", ".")
-        self.assertNotIn("docs/private.md", CHECK.git_paths(self.root, "ls-files", "--cached", "-z"))
+        staged = CHECK.git_paths(self.root, "ls-files", "--cached", "-z")
+        self.assertTrue(private.isdisjoint(staged))
+        self.assertEqual(CHECK.check_repository(self.root), [])
         self.assertEqual(CHECK.check_repository(self.root, all_files=True), [])
-        self.git("add", "--force", "docs/private.md")
+        self.write("README.md", "[architecture](docs/architecture.md)\n[private](docs/private.md)\n")
+        self.git("add", "README.md")
+        for all_files in (False, True):
+            issues = CHECK.check_repository(self.root, all_files=all_files)
+            for line in (1, 2):
+                self.assertIn(("README.md", line, "本地链接目标未纳入发布文件"), issues)
+        self.git("add", "--force", *sorted(private))
         for all_files in (False, True):
             with self.subTest(all_files=all_files):
                 issues = CHECK.check_repository(self.root, all_files=all_files)
-                self.assertIn(("docs/private.md", 1, "禁止发布的本地文件或产物"), issues)
+                rejected = {path for path, _line, category in issues if category == "禁止发布的本地文件或产物"}
+                self.assertEqual(rejected, private)
 
 
 if __name__ == "__main__":

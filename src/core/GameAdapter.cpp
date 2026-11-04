@@ -27,4 +27,33 @@ namespace gamehub
 		}
 		return *found->second;
 	}
+
+	void GameRegistry::addChannel(std::string gameId, std::string channelId, std::unique_ptr<ChannelAdapter> adapter)
+	{
+		find(gameId);
+		if (!adapter || !validKey(channelId, 32) || channelId == "." || channelId == "..")
+		{
+			throw std::invalid_argument("渠道实例标识无效");
+		}
+		if (!channels_[std::move(gameId)].emplace(std::move(channelId), std::move(adapter)).second)
+		{
+			throw std::invalid_argument("渠道实例标识重复");
+		}
+	}
+
+	const ChannelAdapter& GameRegistry::channel(const std::string& gameId, const std::string& channelId) const
+	{
+		find(gameId);
+		const auto game = channels_.find(gameId);
+		if (game == channels_.end())
+		{
+			throw ApiError(404, "渠道实例不存在");
+		}
+		const auto found = game->second.find(channelId);
+		if (found == game->second.end())
+		{
+			throw ApiError(404, "渠道实例不存在");
+		}
+		return *found->second;
+	}
 } // namespace gamehub

@@ -37,9 +37,45 @@ namespace gamehub
 			return value->as_object();
 		}
 
+		unsigned optionalUnsigned(const boost::json::object& object,
+								  std::string_view key,
+								  unsigned fallback,
+								  unsigned minimum,
+								  unsigned maximum)
+		{
+			return object.if_contains(key) ? static_cast<unsigned>(requiredInt(object, key, minimum, maximum))
+										   : fallback;
+		}
+
+		std::vector<std::string> parseWorkerGames(const boost::json::object& object)
+		{
+			std::vector<std::string> games;
+			const auto* selected = object.if_contains("games");
+			if (!selected)
+			{
+				return games;
+			}
+			if (!selected->is_array() || selected->as_array().size() > 100)
+			{
+				throw ConfigError("worker.games 必须是至多 100 个游戏标识的数组");
+			}
+			std::set<std::string> ids;
+			for (const auto& value : selected->as_array())
+			{
+				if (!value.is_string() || !validKey(value.as_string(), 32)
+					|| !ids.insert(std::string(value.as_string())).second)
+				{
+					throw ConfigError("worker.games 包含非法或重复游戏标识");
+				}
+				games.emplace_back(value.as_string());
+			}
+			return games;
+		}
+
 		WorkerConfig parseWorker(const boost::json::object& object)
 		{
 			WorkerConfig worker;
+			worker.games = parseWorkerGames(object);
 			worker.pollMs = static_cast<unsigned>(requiredInt(object, "pollMs", 10, 60000));
 			worker.concurrency = static_cast<unsigned>(requiredInt(object, "concurrency", 1, 32));
 			worker.leaseSeconds = static_cast<unsigned>(requiredInt(object, "leaseSeconds", 10, 3600));
@@ -64,17 +100,82 @@ namespace gamehub
 			return worker;
 		}
 
+		ChannelConfig parseChannel(const boost::json::object& object)
+		{
+			ChannelConfig channel;
+			channel.id = requiredString(object, "id", 32);
+			channel.adapter = requiredString(object, "adapter", 32);
+			channel.nameSpace = requiredString(object, "namespace", 32);
+			if (!validKey(channel.id, 32) || channel.id == "." || channel.id == ".." || !validKey(channel.adapter, 32)
+				|| !validKey(channel.nameSpace, 32))
+			{
+				throw ConfigError("渠道实例、类型或命名空间无效");
+			}
+			if (object.if_contains("secretEnv"))
+			{
+				channel.secret = secretFromEnv(requiredString(object, "secretEnv", 96), 32);
+			}
+			if (object.if_contains("options"))
+			{
+				channel.options = objectAt(object, "options");
+			}
+			return channel;
+		}
+
+		void parseGameOptions(GameConfig& game, const boost::json::object& object)
+		{
+			if (const auto* enabled = object.if_contains("deliveryEnabled"))
+			{
+				if (!enabled->is_bool())
+				{
+					throw ConfigError("deliveryEnabled 必须是布尔值");
+				}
+				game.deliveryEnabled = enabled->as_bool();
+			}
+			game.maxConcurrentDeliveries = optionalUnsigned(object, "maxConcurrentDeliveries", 0, 0, 32);
+			game.maxConcurrentPerServer = optionalUnsigned(object, "maxConcurrentPerServer", 0, 0, 32);
+			game.callbackRatePerSecond = optionalUnsigned(object, "callbackRatePerSecond", 100, 1, 100000);
+			game.callbackBurst = optionalUnsigned(object, "callbackBurst", 200, 1, 100000);
+			if (object.if_contains("options"))
+			{
+				game.options = objectAt(object, "options");
+			}
+			const auto* channels = object.if_contains("channels");
+			if (!channels)
+			{
+				game.callbackSecret = secretFromEnv(requiredString(object, "callbackSecretEnv", 96), 32);
+				return;
+			}
+			if (!channels->is_array() || channels->as_array().empty() || channels->as_array().size() > 32)
+			{
+				throw ConfigError("channels 必须包含 1 至 32 个渠道实例");
+			}
+			std::set<std::string> ids;
+			for (const auto& value : channels->as_array())
+			{
+				auto channel = parseChannel(value.as_object());
+				if (!ids.insert(channel.id).second)
+				{
+					throw ConfigError("渠道实例标识重复");
+				}
+				game.channels.push_back(std::move(channel));
+			}
+		}
+
 		GameConfig parseGame(const boost::json::object& object)
 		{
 			GameConfig game;
 			game.id = requiredString(object, "id", 32);
-			if (!validKey(game.id, 32) || game.id == "." || game.id == ".."
-				|| requiredString(object, "adapter", 32) != "demo-hmac-v1")
+			game.adapter = requiredString(object, "adapter", 32);
+			if (!validKey(game.id, 32) || game.id == "." || game.id == ".." || !validKey(game.adapter, 32))
 			{
-				throw ConfigError("游戏标识无效，或配置了尚未实现的适配器");
+				throw ConfigError("游戏或适配器标识无效");
 			}
-			game.callbackSecret = secretFromEnv(requiredString(object, "callbackSecretEnv", 96), 32);
-			game.outboundSecret = secretFromEnv(requiredString(object, "outboundSecretEnv", 96), 32);
+			parseGameOptions(game, object);
+			if (object.if_contains("outboundSecretEnv"))
+			{
+				game.outboundSecret = secretFromEnv(requiredString(object, "outboundSecretEnv", 96), 32);
+			}
 			const auto& servers = object.at("servers").as_array();
 			if (servers.empty() || servers.size() > 1000)
 			{
@@ -161,6 +262,13 @@ namespace gamehub
 				throw ConfigError("游戏标识重复");
 			}
 			result.games.push_back(std::move(game));
+		}
+		for (const auto& selected : result.worker.games)
+		{
+			if (!ids.contains(selected))
+			{
+				throw ConfigError("worker.games 引用了未配置的游戏");
+			}
 		}
 		return result;
 	}

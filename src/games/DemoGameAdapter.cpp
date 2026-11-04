@@ -45,41 +45,6 @@ namespace gamehub
 		return config_.id;
 	}
 
-	Submission DemoGameAdapter::parseCallback(std::string_view channel,
-											  const SignedRequest& request,
-											  std::int64_t now) const
-	{
-		if (channel != "demo")
-		{
-			throw ApiError(404, "尚未支持此渠道");
-		}
-		if (!verifySignature(config_.callbackSecret,
-							 request.timestamp,
-							 request.signature,
-							 signatureInput(request.timestamp, request.method, request.path, request.body),
-							 now))
-		{
-			throw ApiError(401, "签名无效或请求已过期");
-		}
-		const auto order = normalizeDemoOrder(parseObject(request.body));
-		const auto serverId = static_cast<std::uint32_t>(order.at("serverId").as_int64());
-		config_.endpoint(serverId);
-		Submission input;
-		input.gameId = config_.id;
-		input.taskType = "recharge_notify";
-		input.nameSpace = "demo";
-		input.bizKey = std::string(order.at("channelOrderId").as_string());
-		if (order.at("bizKey").as_string() != input.bizKey)
-		{
-			throw ApiError(400, "演示渠道要求 bizKey 等于 channelOrderId");
-		}
-		input.payload = canonicalJson(order);
-		input.fingerprint = sha256(input.payload);
-		input.servers = {serverId};
-		input.actor = "callback:demo";
-		return input;
-	}
-
 	std::string DemoGameAdapter::signOutbound(const SignedRequest& request) const
 	{
 		return hmacSha256(config_.outboundSecret,
