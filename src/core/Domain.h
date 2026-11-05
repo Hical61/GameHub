@@ -62,6 +62,7 @@ namespace gamehub
 		std::string payload;
 		unsigned attempts = 0;
 		std::uint64_t eventId = 0;
+		std::int64_t createdAtUnixMicros = 0;
 		std::string nameSpace;
 		unsigned payloadVersion = kCurrentPayloadVersion;
 		unsigned fingerprintVersion = kCurrentFingerprintVersion;

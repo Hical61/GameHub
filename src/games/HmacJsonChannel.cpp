@@ -26,11 +26,14 @@ namespace gamehub
 			throw ApiError(401, "签名无效或请求已过期");
 		}
 		const auto timestamp = request.header("X-Timestamp");
-		if (!verifySignature(channel_.secret,
-							 timestamp,
-							 request.header("X-Signature"),
-							 signatureInput(timestamp, request.method, request.path, request.body),
-							 now))
+		const auto keyId = request.header("X-Key-Id");
+		const auto secret = selectVerificationKey(channel_.secret, channel_.keys, keyId);
+		if (secret.empty()
+			|| !verifySignature(secret,
+								timestamp,
+								request.header("X-Signature"),
+								signatureInput(timestamp, request.method, request.path, request.body, keyId),
+								now))
 		{
 			throw ApiError(401, "签名无效或请求已过期");
 		}

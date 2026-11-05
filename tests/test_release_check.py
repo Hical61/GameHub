@@ -63,15 +63,14 @@ class ContentChecks(unittest.TestCase):
                     ".netrc", ".git-credentials", "backups/gamehub.sql", "exports/players.csv", "data/raw/2026/players.json",
                     "gamehub-backup.sql", "players_export.csv", "config.json.bak", "config.json~",
                     "tls/server.pem", "store.sqlite3-wal", "lib/libsample.so.1", "deps.zip",
-                    "docs/private.md", "docs/validation.md", "docs/nested/architecture.md", "docs/architecture.md.bak",
-                    "docs/Architecture.md", "docs/architecture.md", "docs/api.md", "docs/game-integration.md",
-                    "docs/operations.md", "docs/testing.md", "docs/design-notes.md")
+                    "private/docs/notes.md", "private/adapters/SyntheticAdapter.cpp", "private/config/runtime.json",
+                    "nested/Private/notes.md", "docs/architecture.md.bak")
         for path in rejected:
             with self.subTest(path=path):
                 self.assertTrue(CHECK.forbidden_path(path))
         for path in ("scripts/build-release.py", "migrations/001_initial.sql", "migrations/003_backup_table.sql",
                      "examples/players.sample.csv", "examples/players-export.sample.csv", "config/credentials.example.json", "config/gamehub.example.json",
-                     ".env.example", ".env.sample", "src/core/Domain.cpp"):
+                     ".env.example", ".env.sample", "src/core/Domain.cpp", "docs/README.md", "docs/architecture.md"):
             with self.subTest(path=path):
                 self.assertFalse(CHECK.forbidden_path(path))
 
@@ -278,21 +277,21 @@ class GitChecks(unittest.TestCase):
             rejected = {path for path, _line, category in issues if category == "禁止发布的本地文件或产物"}
             self.assertEqual(rejected, set(private))
 
-    def test_docs_remain_local_and_force_add_is_rejected(self):
-        """真实忽略规则排除全部本地文档；强制加入后，两种发布检查都必须拒绝。"""
+    def test_private_tree_is_ignored_but_public_docs_are_publishable(self):
+        """普通添加只纳入公共文档，强制加入私有源码、资料和配置仍会被拒绝。"""
         self.write(".gitignore", (ROOT / ".gitignore").read_text(encoding="utf-8"))
-        private = {"docs/architecture.md", "docs/api.md", "docs/game-integration.md", "docs/operations.md",
-                   "docs/testing.md", "docs/design-notes.md", "docs/private.md", "docs/validation.md",
-                   "docs/development-plan.md", "docs/nested/architecture.md"}
+        private = {"private/adapters/SyntheticAdapter.cpp", "private/docs/notes.md", "private/config/runtime.json"}
         for path in private:
             self.write(path, "synthetic notes\n")
-        self.write("README.md", "synthetic public readme\n")
+        self.write("docs/README.md", "synthetic public guide\n")
+        self.write("README.md", "[guide](docs/README.md)\n")
         self.git("add", ".")
         staged = CHECK.git_paths(self.root, "ls-files", "--cached", "-z")
         self.assertTrue(private.isdisjoint(staged))
+        self.assertIn("docs/README.md", staged)
         self.assertEqual(CHECK.check_repository(self.root), [])
         self.assertEqual(CHECK.check_repository(self.root, all_files=True), [])
-        self.write("README.md", "[architecture](docs/architecture.md)\n[private](docs/private.md)\n")
+        self.write("README.md", "[private](private/docs/notes.md)\n[encoded](%70rivate/docs/notes.md)\n")
         self.git("add", "README.md")
         for all_files in (False, True):
             issues = CHECK.check_repository(self.root, all_files=all_files)
@@ -304,6 +303,24 @@ class GitChecks(unittest.TestCase):
                 issues = CHECK.check_repository(self.root, all_files=all_files)
                 rejected = {path for path, _line, category in issues if category == "禁止发布的本地文件或产物"}
                 self.assertEqual(rejected, private)
+                for line in (1, 2):
+                    self.assertIn(("README.md", line, "本地链接目标未纳入发布文件"), issues)
+
+    def test_git_symlink_to_private_is_rejected_even_with_plain_worktree_file(self):
+        """用真实 Git 链接模式验证强制暂存，兼容无创建符号链接权限的 Windows。"""
+        self.write("private/adapters/SyntheticAdapter.cpp", "// synthetic private implementation\n")
+        self.write("adapter-link.cpp", "private/adapters/SyntheticAdapter.cpp")
+        blob = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"],
+            input=b"private/adapters/SyntheticAdapter.cpp", capture_output=True, check=True).stdout.strip().decode()
+        self.git("update-index", "--add", "--cacheinfo", "120000", blob, "adapter-link.cpp")
+        self.write("README.md", "[adapter](adapter-link.cpp)\n")
+        self.git("add", "README.md")
+        self.assertEqual(CHECK.git_modes(self.root)["adapter-link.cpp"], b"120000")
+        for all_files in (False, True):
+            with self.subTest(all_files=all_files):
+                issues = CHECK.check_repository(self.root, all_files=all_files)
+                self.assertIn(("adapter-link.cpp", 1, "发布文件不能是本地符号链接"), issues)
+                self.assertIn(("README.md", 1, "本地链接目标未纳入发布文件"), issues)
 
 
 if __name__ == "__main__":

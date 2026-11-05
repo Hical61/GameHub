@@ -27,6 +27,8 @@ namespace gamehub
 		std::string_view gameId() const override;
 		/// @param request 签名需要的请求信息。@return HMAC-SHA256 签名。
 		std::string signOutbound(const SignedRequest& request) const override;
+		/// @return 当前出向签名的密钥标识；空值保持旧协议。
+		std::string_view outboundKeyId() const override;
 		/// @param request 完整请求；now 当前 UTC 秒。@return 内部请求的签名和时间戳是否有效。
 		bool verifyInternalRequest(const SignedRequest& request, std::int64_t now) const override;
 

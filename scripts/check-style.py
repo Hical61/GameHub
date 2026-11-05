@@ -30,7 +30,7 @@ def cpp_files():
     """只检查 src 和 tests 里的 C++ 文件。"""
     return sorted(
         path.resolve()
-        for folder in (ROOT / "src", ROOT / "tests")
+        for folder in (ROOT / "src", ROOT / "tests", ROOT / "examples")
         for path in folder.rglob("*")
         if path.is_file() and path.suffix in CPP_SUFFIXES
     )

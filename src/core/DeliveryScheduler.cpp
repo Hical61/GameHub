@@ -32,11 +32,52 @@ namespace gamehub
 			game.limit = std::min(game.limit, globalLimit_);
 			game.targetLimit = source.maxConcurrentPerServer == 0 ? game.limit : source.maxConcurrentPerServer;
 			game.targetLimit = std::min(game.targetLimit, game.limit);
+			game.configuredLimit = source.maxConcurrentDeliveries;
+			game.configuredTargetLimit = source.maxConcurrentPerServer;
 			for (const auto& endpoint : source.servers)
 			{
 				game.targets.push_back(Target {endpoint.id, 0, {}});
 			}
 			games_.push_back(std::move(game));
+		}
+	}
+
+	void DeliveryScheduler::refreshLimits()
+	{
+		enabledGames_ = static_cast<std::size_t>(std::count_if(games_.begin(),
+															   games_.end(),
+															   [](const Game& game)
+															   {
+																   return game.enabled;
+															   }));
+		const auto automaticLimit =
+			std::max(1u, globalLimit_ / static_cast<unsigned>(std::max<std::size_t>(1, enabledGames_)));
+		for (auto& game : games_)
+		{
+			game.limit = std::min(game.configuredLimit == 0 ? automaticLimit : game.configuredLimit, globalLimit_);
+			game.targetLimit =
+				std::min(game.configuredTargetLimit == 0 ? game.limit : game.configuredTargetLimit, game.limit);
+		}
+	}
+
+	void DeliveryScheduler::applyControl(std::string_view gameId,
+										 bool enabled,
+										 unsigned gameLimit,
+										 unsigned targetLimit,
+										 std::uint64_t revision)
+	{
+		for (auto& game : games_)
+		{
+			if (game.id != gameId || revision <= game.controlRevision)
+			{
+				continue;
+			}
+			game.enabled = game.selected && enabled;
+			game.configuredLimit = gameLimit;
+			game.configuredTargetLimit = targetLimit;
+			game.controlRevision = revision;
+			refreshLimits();
+			return;
 		}
 	}
 
@@ -80,7 +121,7 @@ namespace gamehub
 	}
 
 	DeliveryScheduler::Reservation::Reservation(DeliveryScheduler& scheduler, std::size_t gameIndex)
-		: scheduler_(&scheduler), gameIndex_(gameIndex)
+		: scheduler_(&scheduler), gameIndex_(gameIndex), admittedTargetLimit_(scheduler.games_[gameIndex].targetLimit)
 	{
 	}
 
@@ -90,7 +131,10 @@ namespace gamehub
 	}
 
 	DeliveryScheduler::Reservation::Reservation(Reservation&& other) noexcept
-		: scheduler_(std::exchange(other.scheduler_, nullptr)), gameIndex_(other.gameIndex_), serverId_(other.serverId_)
+		: scheduler_(std::exchange(other.scheduler_, nullptr))
+		, gameIndex_(other.gameIndex_)
+		, serverId_(other.serverId_)
+		, admittedTargetLimit_(other.admittedTargetLimit_)
 	{
 	}
 
@@ -102,6 +146,7 @@ namespace gamehub
 			scheduler_ = std::exchange(other.scheduler_, nullptr);
 			gameIndex_ = other.gameIndex_;
 			serverId_ = other.serverId_;
+			admittedTargetLimit_ = other.admittedTargetLimit_;
 		}
 		return *this;
 	}
@@ -148,7 +193,8 @@ namespace gamehub
 		}
 		auto& game = scheduler_->games_[gameIndex_];
 		auto& target = scheduler_->target(game, serverId);
-		if (target.inFlight >= game.targetLimit)
+		// 领取期间允许刷新配额；这次预占按领取前的目标限额准入，后续 reserve 使用新限额。
+		if (target.inFlight >= admittedTargetLimit_)
 		{
 			throw std::logic_error("任务领取没有排除已满额目标");
 		}
@@ -271,6 +317,7 @@ namespace gamehub
 			targets.push_back(std::move(item));
 		}
 		result["targets"] = std::move(targets);
+		result["controlRevision"] = std::to_string(game.controlRevision);
 		return result;
 	}
 

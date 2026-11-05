@@ -21,10 +21,8 @@ namespace gamehub
 	namespace
 	{
 		constexpr auto kCallbackTimeout = std::chrono::milliseconds(2500);
-		constexpr auto kMonitorInterval = std::chrono::seconds(30);
 		constexpr double kIdleTimeoutSeconds = 15;
 		constexpr double kShutdownTimeoutSeconds = 20;
-		constexpr unsigned kBacklogAlertSeconds = 60;
 
 		hical::HttpResponse response(int status, const boost::json::value& body)
 		{
@@ -62,7 +60,8 @@ namespace gamehub
 					request.header("X-Signature"),
 					request.method() == hical::HttpMethod::hPost ? "POST" : "GET",
 					request.path(),
-					request.body()};
+					request.body(),
+					request.header("X-Key-Id")};
 		}
 
 		hical::HttpResponse callbackResponse(CallbackReply reply)
@@ -176,6 +175,12 @@ namespace gamehub
 		router.get("/admin/tasks/{game}/{after}", handler);
 		router.get("/admin/archive/{game}/{after}", handler);
 		router.get("/admin/audit/{game}/{after}", handler);
+		router.get("/admin/events/{game}/{type}/{namespace}/{key}", handler);
+		router.get("/admin/attempts/{game}/{id}/{after}", handler);
+		router.get("/admin/control/{game}", handler);
+		router.get("/admin/config-status/{game}/{after}", handler);
+		router.post("/admin/control/{game}", handler);
+		router.post("/internal/config-applied/{game}/{server}", handler);
 		router.post("/admin/tasks/{game}/{id}/replay", handler);
 		router.post("/admin/archive/{game}", handler);
 		router.post("/admin/announce/{game}", handler);
@@ -184,94 +189,13 @@ namespace gamehub
 		router.get("/internal/config/{game}/{server}/{version}", handler);
 	}
 
-	void Application::registerTasks()
-	{
-		const auto weak = weak_from_this();
-		const auto interval = std::chrono::milliseconds(config_.worker.pollMs);
-		server_.addPeriodicTask("schema-and-recovery",
-								interval,
-								[weak]() -> Awaitable<void>
-								{
-									auto self = weak.lock();
-									if (!self || self->stopping_)
-									{
-										co_return;
-									}
-									try
-									{
-										co_await self->store_.checkSchema();
-										self->schemaReady_ = true;
-										const auto count =
-											co_await self->store_.recover(self->config_.worker, self->recoveryGames_);
-										if (count > 0)
-										{
-											HICAL_LOG_WARN("已回收过期的投递租约，count={}", count);
-										}
-									}
-									catch (const boost::system::system_error& error)
-									{
-										self->schemaReady_ = false;
-										HICAL_LOG_ERROR("数据库或迁移检查失败，category={} code={}，暂不接收业务请求",
-														error.code().category().name(),
-														error.code().value());
-									}
-									catch (const std::exception&)
-									{
-										self->schemaReady_ = false;
-										HICAL_LOG_ERROR("数据库或迁移检查失败，暂不接收业务请求");
-									}
-								});
-		for (unsigned slot = 0; slot < config_.worker.concurrency; ++slot)
-		{
-			server_.addPeriodicTask("delivery-" + std::to_string(slot),
-									interval,
-									[weak]() -> Awaitable<void>
-									{
-										auto self = weak.lock();
-										if (self && self->schemaReady_ && !self->stopping_)
-										{
-											try
-											{
-												co_await self->worker_.tick();
-											}
-											catch (const boost::system::system_error& error)
-											{
-												HICAL_LOG_ERROR(
-													"投递时数据库操作失败，category={} code={}，任务将等待租约回收",
-													error.code().category().name(),
-													error.code().value());
-											}
-											catch (const std::exception&)
-											{
-												HICAL_LOG_ERROR("投递时数据库操作失败，任务将等待租约回收");
-											}
-										}
-									});
-		}
-		server_.addPeriodicTask("delivery-monitor",
-								kMonitorInterval,
-								[weak]() -> Awaitable<void>
-								{
-									auto self = weak.lock();
-									if (!self || !self->schemaReady_ || self->stopping_)
-									{
-										co_return;
-									}
-									const auto stats = co_await self->store_.stats();
-									if (stats.at("failed").to_number<std::uint64_t>() > 0
-										|| stats.at("oldestPendingSeconds").to_number<std::uint64_t>()
-											   > kBacklogAlertSeconds)
-									{
-										HICAL_LOG_ERROR("有任务积压或投递失败，请查看 /admin/stats");
-									}
-								});
-	}
-
 	Awaitable<hical::HttpResponse> Application::handle(const hical::HttpRequest& request)
 	{
 		try
 		{
-			if (!request.path().starts_with("/api/callback/") && request.target().find('?') != std::string_view::npos)
+			if (!request.path().starts_with("/api/callback/")
+				&& !(request.method() == hical::HttpMethod::hGet && request.path().starts_with("/admin/tasks/"))
+				&& request.target().find('?') != std::string_view::npos)
 			{
 				throw ApiError(400, "当前接口不接受查询参数");
 			}
@@ -310,7 +234,13 @@ namespace gamehub
 		try
 		{
 			hical::JwtAuthOptions options;
-			options.secret = config_.jwtSecret;
+			const auto token = authorization.substr(kPrefix.size());
+			const auto keyId = readJwtKeyId(token);
+			options.secret = std::string(selectVerificationKey(config_.jwtSecret, config_.jwtKeys, keyId));
+			if (options.secret.empty())
+			{
+				throw ApiError(401, "管理令牌密钥标识无效");
+			}
 			options.issuer = config_.jwtIssuer;
 			options.audience = config_.jwtAudience;
 			claims = hical::jwtVerify(authorization.substr(kPrefix.size()), options);
@@ -379,6 +309,7 @@ namespace gamehub
 	Awaitable<hical::HttpResponse> Application::callback(const hical::HttpRequest& request)
 	{
 		const auto& channel = registry_.channel(request.param("game"), request.param("channel"));
+		const auto started = std::chrono::steady_clock::now();
 		CallbackResult outcome;
 		try
 		{
@@ -416,6 +347,8 @@ namespace gamehub
 			outcome.status = 503;
 			outcome.message = "依赖服务暂时不可用，请保留原业务键重试";
 		}
+		callbackLatencies_[request.param("game")].observe(
+			std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 		co_return callbackResponse(channel.reply(outcome));
 	}
 
@@ -459,6 +392,10 @@ namespace gamehub
 	{
 		const auto gameId = request.param("game");
 		config_.game(gameId);
+		if (request.path().starts_with("/admin/control/"))
+		{
+			co_return co_await controlWrite(request, actor);
+		}
 		if (request.path().starts_with("/admin/archive/"))
 		{
 			co_return co_await archive(request, actor);
@@ -526,6 +463,10 @@ namespace gamehub
 		{
 			throw ApiError(503, "服务未就绪");
 		}
+		if (path.starts_with("/internal/config-applied/"))
+		{
+			co_return co_await configApplied(request);
+		}
 		if (path.starts_with("/internal/config/"))
 		{
 			const auto& game = config_.game(request.param("game"));
@@ -579,6 +520,12 @@ namespace gamehub
 			stats["requestsRejected"] = rejected_;
 			co_return response(200, stats);
 		}
+		if (path.starts_with("/admin/events/") || path.starts_with("/admin/attempts/")
+			|| path.starts_with("/admin/control/") || path.starts_with("/admin/config-status/")
+			|| path.starts_with("/admin/tasks/"))
+		{
+			co_return co_await operationsRead(request);
+		}
 		const auto& game = config_.game(request.param("game"));
 		auto after = pathNumber(request.param("after"), true);
 		if (path.starts_with("/admin/archive/"))
@@ -608,29 +555,4 @@ namespace gamehub
 		co_return response(200, boost::json::object {{"archivedTasks", archived}, {"redactedEvents", redacted}});
 	}
 
-	Awaitable<hical::HttpResponse> Application::metrics()
-	{
-		const auto stats = co_await store_.stats();
-		std::string body = "# HELP gamehub_tasks 按状态统计的当前任务数。\n# TYPE gamehub_tasks gauge\n";
-		for (const auto* state : {"pending", "delivering", "done", "failed"})
-		{
-			body += "gamehub_tasks{state=\"" + std::string(state) + "\"} "
-					+ std::to_string(stats.at(state).to_number<std::uint64_t>()) + "\n";
-		}
-		const auto append = [&body](std::string_view name, std::string_view type, std::uint64_t value)
-		{
-			body += "# TYPE " + std::string(name) + " " + std::string(type) + "\n" + std::string(name) + " "
-					+ std::to_string(value) + "\n";
-		};
-		append("gamehub_archived_tasks", "gauge", stats.at("archivedDone").to_number<std::uint64_t>());
-		append("gamehub_oldest_pending_seconds", "gauge", stats.at("oldestPendingSeconds").to_number<std::uint64_t>());
-		append("gamehub_callbacks_accepted_total", "counter", accepted_);
-		append("gamehub_callbacks_duplicate_total", "counter", duplicates_);
-		append("gamehub_requests_rejected_total", "counter", rejected_);
-		hical::HttpResponse result;
-		result.setStatus(static_cast<hical::HttpStatusCode>(200));
-		result.setHeader("Cache-Control", "no-store");
-		result.setBody(std::move(body), "text/plain; version=0.0.4; charset=utf-8");
-		co_return result;
-	}
 } // namespace gamehub

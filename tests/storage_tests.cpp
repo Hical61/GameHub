@@ -616,6 +616,20 @@ namespace
 		const auto empty = co_await store.stats("storage-empty");
 		require(empty.at("pending").to_number<unsigned>() == 0 && empty.at("completedTotal").to_number<unsigned>() == 0,
 				"无任务游戏统计未返回零值");
+		const auto queries = database->metrics().queries;
+		std::vector<std::string> games {"storage-alpha", "storage-beta", "storage-empty"};
+		const auto grouped = co_await store.gameStats(games);
+		require(database->metrics().queries == queries + 1 && grouped.size() == 3, "批量游戏统计没有使用一次有界 SQL");
+		for (const auto& item : grouped)
+		{
+			const auto& value = item.as_object();
+			const auto& expected =
+				value.at("gameId") == "storage-alpha" ? after : (value.at("gameId") == "storage-beta" ? beta : empty);
+			for (const auto* key : {"pending", "delivering", "done", "failed", "archivedDone", "oldestPendingSeconds"})
+			{
+				require(value.at(key) == expected.at(key), "批量游戏统计与单游戏统计不一致");
+			}
+		}
 		{
 			auto session = co_await database->acquire();
 			co_await session.query("DELETE FROM delivery_task WHERE game_id IN ('storage-alpha','storage-beta')");
@@ -687,6 +701,293 @@ namespace
 		{
 			std::rethrow_exception(failure);
 		}
+	}
+
+	gamehub::Awaitable<void> verifyAttemptHistory(std::shared_ptr<gamehub::Database> database,
+												  gamehub::Store& store,
+												  gamehub::WorkerConfig worker)
+	{
+		using namespace gamehub;
+		worker.maxAttempts = 1;
+		Submission input {"storage-history",
+						  "announce",
+						  "history",
+						  "attempts",
+						  "{\"privateSynthetic\":true}",
+						  "",
+						  {1},
+						  "storage-test"};
+		input.fingerprint = sha256(input.payload);
+		co_await store.accept(input);
+		auto task = co_await store.claim(worker, input.gameId);
+		require(task.has_value(), "没有领取历史测试任务");
+		auto attempts = co_await store.listAttempts(input.gameId, task->id);
+		require(attempts.size() == 1 && attempts[0].as_object().at("finishedAt").is_null(), "领取没有原子创建在途尝试");
+		require(co_await store.finish(*task, false, "禁止保存的合成原始响应", 0, 1), "未记录首次失败");
+		attempts = co_await store.listAttempts(input.gameId, task->id);
+		require(attempts[0].as_object().at("outcome") == "failure"
+					&& attempts[0].as_object().at("errorCategory") == "delivery_exception",
+				"尝试记录保存了非固定错误");
+		require(co_await store.replay(input.gameId, task->id, "storage-test"), "历史测试任务不能重排");
+		auto next = co_await store.claim(worker, input.gameId);
+		require(next && next->generation > task->generation && next->attempts == 1, "重排未保留代次且重置尝试次数");
+		{
+			auto session = co_await database->acquire();
+			std::vector<std::string> key {std::to_string(next->id)};
+			co_await session.query(
+				"UPDATE delivery_task SET lease_until=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6)) WHERE id=?",
+				key);
+		}
+		require(!(co_await store.finish(*next, true, "", 0, 1)), "过期租约错误完成尝试");
+		require((co_await store.recover(worker, {input.gameId})) == 1, "过期历史测试任务未回收");
+		attempts = co_await store.listAttempts(input.gameId, task->id);
+		require(attempts.size() == 2 && attempts[1].as_object().at("outcome") == "lease_expired",
+				"回收未结束对应代次尝试");
+		require(co_await store.replay(input.gameId, task->id, "storage-test"), "回收任务不能重排");
+		auto final = co_await store.claim(worker, input.gameId);
+		require(final && co_await store.finish(*final, true, "", 0, 1), "历史测试任务最终确认失败");
+		{
+			auto session = co_await database->acquire();
+			std::vector<std::string> key {std::to_string(task->id)};
+			co_await session.query(
+				"UPDATE delivery_task SET updated_at=TIMESTAMPADD(DAY,-3,UTC_TIMESTAMP(6)) WHERE id=?",
+				key);
+		}
+		require((co_await store.archiveDone(input.gameId, 1, 10, "storage-test")) == 1, "历史任务不能归档");
+		attempts = co_await store.listAttempts(input.gameId, task->id);
+		require(attempts.size() == 3 && attempts[2].as_object().at("outcome") == "success", "归档丢失投递尝试历史");
+		auto event = co_await store.lookupEvent(input.gameId, input.taskType, input.nameSpace, input.bizKey);
+		require(event.at("tasks").as_array().size() == 1
+					&& event.at("tasks").as_array()[0].as_object().at("archived").as_bool(),
+				"业务身份不能查归档任务");
+		require(boost::json::serialize(event).find("privateSynthetic") == std::string::npos, "事件检索泄露业务载荷");
+	}
+
+	gamehub::Awaitable<void> verifyAttemptRollback(std::shared_ptr<gamehub::Database> database,
+												   gamehub::Store& store,
+												   const gamehub::WorkerConfig& worker)
+	{
+		using namespace gamehub;
+		Submission
+			input {"storage-attempt-atomic", "announce", "history", "atomic", "{}", sha256("{}"), {1}, "storage-test"};
+		co_await store.accept(input);
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("CREATE TRIGGER synthetic_attempt_insert BEFORE INSERT ON delivery_attempt "
+								   "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='synthetic'");
+		}
+		bool rejected = false;
+		try
+		{
+			co_await store.claim(worker, input.gameId);
+		}
+		catch (const boost::system::system_error&)
+		{
+			rejected = true;
+		}
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("DROP TRIGGER synthetic_attempt_insert");
+		}
+		require(rejected, "尝试写入失败没有传播");
+		auto task = co_await store.claim(worker, input.gameId);
+		require(task && task->attempts == 1 && task->generation == 1, "尝试写入失败未回滚领取事务");
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("CREATE TRIGGER synthetic_attempt_update BEFORE UPDATE ON delivery_attempt "
+								   "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='synthetic'");
+		}
+		rejected = false;
+		try
+		{
+			co_await store.finish(*task, true, "", 0, worker.maxAttempts);
+		}
+		catch (const boost::system::system_error&)
+		{
+			rejected = true;
+		}
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("DROP TRIGGER synthetic_attempt_update");
+		}
+		require(rejected && co_await store.finish(*task, true, "", 0, worker.maxAttempts),
+				"尝试结束失败未回滚任务确认");
+	}
+
+	gamehub::Awaitable<void> verifyTaskFilters(gamehub::Store& store, gamehub::WorkerConfig worker)
+	{
+		using namespace gamehub;
+		Submission
+			input {"storage-filter", "announce", "history", "filters", "{}", sha256("{}"), {1, 2}, "storage-test"};
+		co_await store.accept(input);
+		TaskFilter filter;
+		filter.status = TaskStatus::Pending;
+		filter.serverId = 2;
+		filter.createdFrom = unixSeconds() - 60;
+		filter.createdBefore = unixSeconds() + 60;
+		filter.limit = 1;
+		auto tasks = co_await store.listTasks(input.gameId, filter);
+		require(tasks.size() == 1 && tasks[0].as_object().at("serverId").to_number<unsigned>() == 2,
+				"任务筛选范围错误");
+		filter.after = std::stoull(std::string(tasks[0].as_object().at("id").as_string()));
+		require((co_await store.listTasks(input.gameId, filter)).empty(), "筛选游标重复返回任务");
+		filter.limit = 101;
+		bool rejected = false;
+		try
+		{
+			co_await store.listTasks(input.gameId, filter);
+		}
+		catch (const ApiError& error)
+		{
+			rejected = error.status == 400;
+		}
+		require(rejected, "任务分页未限制数量");
+		for (unsigned count = 0; count < 2; ++count)
+		{
+			auto task = co_await store.claim(worker, input.gameId);
+			require(task && co_await store.finish(*task, true, "", 0, worker.maxAttempts), "筛选测试任务未完成");
+		}
+	}
+
+	gamehub::Awaitable<void> verifyConfigState(gamehub::Store& store)
+	{
+		using namespace gamehub;
+		Submission
+			input {"storage-config-state", "config", "admin", "config:1", "{}", sha256("{}"), {1}, "storage-test"};
+		co_await store.publishConfig(input, 1, "{\"version\":1}");
+		input.bizKey = "config:2";
+		co_await store.publishConfig(input, 2, "{\"version\":2}");
+		auto report = co_await store.reportConfigApplied(input.gameId, 1, 2, sha256("{\"version\":2}"));
+		require(report.at("applied").as_bool(), "配置应用报告未受理");
+		co_await store.reportConfigApplied(input.gameId, 1, 2, sha256("{\"version\":2}"));
+		bool stale = false;
+		try
+		{
+			co_await store.reportConfigApplied(input.gameId, 1, 1, sha256("{\"version\":1}"));
+		}
+		catch (const ApiError& error)
+		{
+			stale = error.status == 409;
+		}
+		require(stale, "旧应用报告覆盖新状态");
+		bool mismatch = false;
+		try
+		{
+			co_await store.reportConfigApplied(input.gameId, 2, 2, sha256("wrong"));
+		}
+		catch (const ApiError& error)
+		{
+			mismatch = error.status == 409;
+		}
+		auto states = co_await store.listConfigStates(input.gameId);
+		require(mismatch && states.size() == 1 && states[0].as_object().at("version").to_number<unsigned>() == 2,
+				"摘要不匹配仍写入应用状态");
+		require((co_await store.listConfigStates(input.gameId, 1)).empty(), "配置状态分页重复");
+		bool missing = false;
+		try
+		{
+			co_await store.reportConfigApplied(input.gameId, 3, 3, sha256("{}"));
+		}
+		catch (const ApiError& error)
+		{
+			missing = error.status == 404;
+		}
+		require(missing, "不存在的配置版本仍能报告已应用");
+		WorkerConfig worker;
+		for (unsigned count = 0; count < 2; ++count)
+		{
+			auto task = co_await store.claim(worker, input.gameId);
+			require(task && co_await store.finish(*task, true, "", 0, worker.maxAttempts), "配置状态测试任务未完成");
+		}
+	}
+
+	gamehub::Awaitable<void> verifyConfigCanonicalBytes(gamehub::Store& store)
+	{
+		using namespace gamehub;
+		const auto original = parseObject(R"({"z":1.0,"small":0.00001,"large":1e20,"text":"合成配置","zero":-0.0})");
+		const auto canonical = canonicalJson(original);
+		Submission input {"storage-config-numeric",
+						  "config_push",
+						  "admin",
+						  "numeric:1",
+						  "{}",
+						  sha256("{}"),
+						  {1},
+						  "storage-test"};
+		co_await store.publishConfig(input, 1, canonical);
+		const auto restored = co_await store.readConfig(input.gameId, 1);
+		const auto wire = std::string(restored.at("canonicalContent").as_string());
+		require(wire == canonical && sha256(wire) == restored.at("sha256").as_string(),
+				"MySQL 读回的浮点/字符串配置没有保持可跨语言校验的规范字节");
+		co_await store.reportConfigApplied(input.gameId, 1, 1, sha256(wire));
+		WorkerConfig worker;
+		auto task = co_await store.claim(worker, input.gameId);
+		require(task && co_await store.finish(*task, true, "", 0, worker.maxAttempts), "数字配置测试通知未完成");
+	}
+
+	gamehub::Awaitable<void> verifyDeliveryControl(gamehub::Store& store)
+	{
+		using namespace gamehub;
+		const std::string game = "storage-control";
+		require(!(co_await store.readDeliveryControl(game)), "没有持久控制时未返回空覆盖");
+		DeliveryControl desired {game, 0, false, 3, 1};
+		auto first = co_await store.updateDeliveryControl(desired, 0, "storage-test");
+		require(first.version == 1 && !first.enabled, "首次控制未创建版本 1");
+		bool conflict = false;
+		try
+		{
+			co_await store.updateDeliveryControl(desired, 0, "storage-test");
+		}
+		catch (const ApiError& error)
+		{
+			conflict = error.status == 409;
+		}
+		require(conflict, "控制创建竞争未拒绝旧版本");
+		desired.enabled = true;
+		auto second = co_await store.updateDeliveryControl(desired, first.version, "storage-test");
+		auto stored = co_await store.readDeliveryControl(game);
+		require(stored && stored->version == 2 && second.version == 2 && stored->enabled, "控制更新未持久化新版本");
+		conflict = false;
+		try
+		{
+			co_await store.updateDeliveryControl(desired, first.version, "storage-test");
+		}
+		catch (const ApiError& error)
+		{
+			conflict = error.status == 409;
+		}
+		require(conflict, "控制旧版本 CAS 更新未拒绝");
+		auto audits = co_await store.listAudit(game, 0);
+		require(audits.size() == 2 && audits[0].as_object().at("action") == "delivery_control",
+				"CAS 冲突产生审计或成功更新漏审计");
+		std::vector<std::string> games {game, "storage-empty-control"};
+		require((co_await store.readDeliveryControls(games)).size() == 1, "批量控制查询超出游戏范围");
+	}
+
+	gamehub::Awaitable<void> verifyControlAuditRollback(std::shared_ptr<gamehub::Database> database,
+														gamehub::Store& store)
+	{
+		using namespace gamehub;
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("CREATE TRIGGER synthetic_control_audit BEFORE INSERT ON audit_log FOR EACH ROW "
+								   "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='synthetic'");
+		}
+		DeliveryControl desired {"storage-control-rollback", 0, false, 1, 1};
+		bool rejected = false;
+		try
+		{
+			co_await store.updateDeliveryControl(desired, 0, "storage-test");
+		}
+		catch (const boost::system::system_error&)
+		{
+			rejected = true;
+		}
+		{
+			auto session = co_await database->acquire();
+			co_await session.query("DROP TRIGGER synthetic_control_audit");
+		}
+		require(rejected && !(co_await store.readDeliveryControl(desired.gameId)), "审计失败仍提交持久投递控制");
 	}
 
 	gamehub::Awaitable<void> verify(std::shared_ptr<gamehub::Database> database, gamehub::Config config)
@@ -783,6 +1084,13 @@ namespace
 		co_await verifyScopedRecovery(database, store, worker);
 		co_await verifyScopedRecoveryBatches(database, store, worker);
 		co_await verifyGameCounts(database, store);
+		co_await verifyAttemptHistory(database, store, worker);
+		co_await verifyAttemptRollback(database, store, worker);
+		co_await verifyTaskFilters(store, worker);
+		co_await verifyConfigState(store);
+		co_await verifyConfigCanonicalBytes(store);
+		co_await verifyDeliveryControl(store);
+		co_await verifyControlAuditRollback(database, store);
 		co_await verifyCancelledSession(std::move(config));
 	}
 } // namespace

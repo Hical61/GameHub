@@ -81,6 +81,20 @@ def seed(fixture):
         events.append(response["eventId"])
     integration.wait_for(lambda: all(fixture.tasks(event_id) and all(value == 2 for value in fixture.tasks(event_id))
                                      for event_id in events), "备份演练投递完成", 30)
+    if int(fixture.sql("SELECT MAX(version) FROM gamehub.schema_version")) >= 4:
+        status, control = fixture.request("POST", "/admin/control/demo", {"expectedRevision": 0,
+            "deliveryEnabled": True, "maxConcurrentDeliveries": 2, "maxConcurrentPerServer": 1}, admin=fixture.admin())
+        if status != 200 or control.get("revision") != "1":
+            raise AssertionError("备份演练未生成共享控制数据")
+        content_hash = hashlib.sha256(json.dumps({"syntheticSetting": True}, sort_keys=True,
+                                                separators=(",", ":")).encode()).hexdigest()
+        status, _ = fixture.request("POST", "/internal/config-applied/demo/1",
+            {"version": 1, "contentHash": content_hash}, signed=True)
+        if status != 200:
+            raise AssertionError("备份演练未生成区服配置应用状态")
+        for table in ("delivery_attempt", "game_delivery_control", "config_server_state"):
+            if int(fixture.sql("SELECT COUNT(*) FROM gamehub." + table)) < 1:
+                raise AssertionError("备份演练缺少投递尝试、共享控制或配置应用数据")
     if int(fixture.sql("SELECT MAX(version) FROM gamehub.schema_version")) >= 2:
         archived = int(events[0])
         fixture.sql(f"UPDATE gamehub.hub_event SET created_at=TIMESTAMPADD(DAY,-3,UTC_TIMESTAMP(6)) WHERE id={archived}; "
@@ -110,6 +124,15 @@ def verify_restored_writes(fixture):
                              "SUM(failed_count),SUM(archived_count) FROM gamehub.delivery_task_counts")
         if list(map(int, actual.split("\t"))) != counts + [archived]:
             raise AssertionError("恢复后的统计触发器或计数不一致")
+    if int(fixture.sql("SELECT MAX(version) FROM gamehub.schema_version")) >= 4:
+        status, control = fixture.request("GET", "/admin/control/demo", admin=fixture.admin())
+        if status != 200 or control.get("revision") != "1" or control.get("maxConcurrentPerServer") != 1:
+            raise AssertionError("恢复后的共享控制与版本不一致")
+        status, state = fixture.request("GET", "/admin/config-status/demo/0", admin=fixture.admin())
+        if status != 200 or not state.get("items"):
+            raise AssertionError("恢复后的区服配置状态缺失")
+        if int(fixture.sql("SELECT COUNT(*) FROM gamehub.delivery_attempt WHERE outcome='success'")) < 1:
+            raise AssertionError("恢复后的投递尝试记录缺失")
 
 
 def execute(source, target, dump_tools=None):

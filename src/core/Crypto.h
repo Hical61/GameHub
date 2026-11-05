@@ -14,11 +14,14 @@ namespace gamehub
 	std::string hmacSha256(std::string_view secret, std::string_view data);
 	/// @param left/right 比较内容。@return 长度是否相等、内容是否一致；同长度内容使用恒定时间比较。
 	bool secureEqual(std::string_view left, std::string_view right);
-	/// @param timestamp Unix 秒数字符串；method HTTP 方法；path 原始路径；body 请求体字节。@return 待签名的字符串。
+	/// @param timestamp Unix 秒数字符串；method HTTP 方法；path 原始路径；body 请求体字节；keyId 可选密钥标识。@return 待签名的字符串；非空标识以换行追加，空值保持旧协议。
 	std::string signatureInput(std::string_view timestamp,
 							   std::string_view method,
 							   std::string_view path,
-							   std::string_view body);
+							   std::string_view body,
+							   std::string_view keyId = {});
+	/// @param token 未验证的 JWT，仅读取有界 JOSE 头用于选密钥。@return kid；未指定时为空；格式无效抛 401。调用方必须继续完整验签及校验声明。
+	std::string readJwtKeyId(std::string_view token);
 	/// @param secret 密钥；timestamp 时间戳头；signature 签名头；input 待验签原文；now 当前 Unix 秒。@return 签名和时间戳是否有效。
 	bool verifySignature(std::string_view secret,
 						 std::string_view timestamp,

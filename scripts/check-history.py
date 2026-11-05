@@ -263,11 +263,15 @@ def flatten_tree(reader, tree_id, parsed_trees):
 def inspect_tree(reader, tree_id, parsed_trees, checked_files):
     """复用发布扫描器检查一个快照；链接只能指向该快照中可发布的文件。"""
     files = flatten_tree(reader, tree_id, parsed_trees)
-    published = {path for path, _mode, _object_id in files if not RELEASE.forbidden_path(path)}
+    published = {path for path, mode, _object_id in files if not RELEASE.forbidden_path(path)
+                 and mode not in {b"120000", b"160000"}}
     issues = []
     for path, mode, object_id in files:
         if RELEASE.forbidden_path(path):
             issues.append((tree_id, path, 1, "禁止发布的本地文件或产物"))
+            continue
+        if mode == b"120000":
+            issues.append((tree_id, path, 1, "发布文件不能是本地符号链接"))
             continue
         if mode == b"160000":
             issues.append((tree_id, path, 1, "无法检查子模块引用的内容"))

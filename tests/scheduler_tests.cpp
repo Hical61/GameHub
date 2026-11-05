@@ -178,6 +178,62 @@ namespace
 		check(count(scheduler.snapshot(), "inFlight") == 0, "目标登记失败也释放领取占用");
 		check(scheduler.reserve().has_value(), "目标登记异常不阻塞后续领取");
 	}
+
+	void controlUpdatesPreserveAdmittedClaims()
+	{
+		auto config = configFor(1);
+		config.games[0].maxConcurrentPerServer = 4;
+		gamehub::DeliveryScheduler scheduler(config);
+		auto active = scheduler.reserve();
+		active->attach(1);
+		auto claiming = scheduler.reserve();
+		check(claiming && claiming->excludedServers().empty(), "领取前目标按原限额开放");
+		auto admittedClaim = std::move(*claiming);
+		claiming.reset();
+		scheduler.applyControl("game-0", true, 1, 1, 1);
+		admittedClaim.attach(1);
+		check(count(scheduler.snapshot("game-0"), "inFlight") == 2, "下调额度不丢弃已经预占的领取");
+		check(!scheduler.reserve(), "新领取遵守下调后的游戏限额");
+		active->complete(gamehub::DeliveryOutcome::Success);
+		check(!scheduler.reserve(), "剩余在途达到新限额时不补新任务");
+		admittedClaim.complete(gamehub::DeliveryOutcome::Success);
+		auto admitted = scheduler.reserve();
+		check(admitted.has_value(), "旧在途释放后恢复新配额");
+		scheduler.applyControl("game-0", false, 1, 1, 2);
+		admitted->attach(1);
+		check(!scheduler.reserve(), "暂停后不领取新任务");
+		admitted->complete(gamehub::DeliveryOutcome::Success);
+		scheduler.applyControl("game-0", true, 4, 4, 1);
+		check(!scheduler.reserve() && !scheduler.snapshot("game-0").at("enabled").as_bool(),
+			  "旧控制响应不能撤销新暂停");
+		scheduler.applyControl("game-0", true, 1, 1, 3);
+		check(scheduler.reserve().has_value(), "更高版本控制恢复领取");
+	}
+
+	void automaticRedistributionPreservesClaims()
+	{
+		auto config = configFor(2);
+		config.games[0].maxConcurrentPerServer = 0;
+		config.games[1].deliveryEnabled = false;
+		gamehub::DeliveryScheduler scheduler(config);
+		auto first = scheduler.reserve();
+		first->attach(1);
+		auto second = scheduler.reserve();
+		second->attach(1);
+		auto claiming = scheduler.reserve();
+		check(claiming && claiming->excludedServers().empty(), "自动额度调整前第三次领取已获准");
+		scheduler.applyControl("game-1", true, 0, 0, 1);
+		claiming->attach(1);
+		check(count(scheduler.snapshot("game-0"), "maxConcurrentPerServer") == 2, "启用其他游戏会重新分配自动限额");
+		auto other = scheduler.reserve();
+		check(other && other->gameId() == "game-1", "旧游戏暂时超额不阻塞新游戏获得剩余名额");
+		other->attach(1);
+		first->complete(gamehub::DeliveryOutcome::Success);
+		second->complete(gamehub::DeliveryOutcome::Success);
+		claiming->complete(gamehub::DeliveryOutcome::Success);
+		other->complete(gamehub::DeliveryOutcome::Success);
+		check(count(scheduler.snapshot(), "inFlight") == 0, "自动配额调整后的所有预占只释放一次");
+	}
 } // namespace
 
 int main()
@@ -187,6 +243,8 @@ int main()
 	movesAndCancellationReleaseOnce();
 	automaticBudgetAndFairness();
 	unavailableTargetAndInvalidAttach();
+	controlUpdatesPreserveAdmittedClaims();
+	automaticRedistributionPreservesClaims();
 	if (failures == 0)
 	{
 		std::cout << "调度与配额测试通过\n";

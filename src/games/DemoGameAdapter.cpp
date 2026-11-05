@@ -47,16 +47,25 @@ namespace gamehub
 
 	std::string DemoGameAdapter::signOutbound(const SignedRequest& request) const
 	{
-		return hmacSha256(config_.outboundSecret,
-						  signatureInput(request.timestamp, request.method, request.path, request.body));
+		return hmacSha256(
+			config_.outboundSecret,
+			signatureInput(request.timestamp, request.method, request.path, request.body, outboundKeyId()));
+	}
+
+	std::string_view DemoGameAdapter::outboundKeyId() const
+	{
+		return config_.outboundKeys.currentKeyId;
 	}
 
 	bool DemoGameAdapter::verifyInternalRequest(const SignedRequest& request, std::int64_t now) const
 	{
-		return verifySignature(config_.outboundSecret,
-							   request.timestamp,
-							   request.signature,
-							   signatureInput(request.timestamp, request.method, request.path, request.body),
-							   now);
+		const auto secret = selectVerificationKey(config_.outboundSecret, config_.outboundKeys, request.keyId);
+		return !secret.empty()
+			   && verifySignature(
+				   secret,
+				   request.timestamp,
+				   request.signature,
+				   signatureInput(request.timestamp, request.method, request.path, request.body, request.keyId),
+				   now);
 	}
 } // namespace gamehub

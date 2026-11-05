@@ -65,15 +65,20 @@ namespace
 	gamehub::Submission parseSigned(const gamehub::ChannelAdapter& adapter,
 									const std::string& secret,
 									std::string_view path,
-									std::string_view body)
+									std::string_view body,
+									std::string_view keyId = {})
 	{
-		const auto signature = gamehub::hmacSha256(secret, gamehub::signatureInput("1000", "POST", path, body));
+		const auto signature = gamehub::hmacSha256(secret, gamehub::signatureInput("1000", "POST", path, body, keyId));
 		const gamehub::CallbackRequest request {"POST",
 												path,
 												path,
 												body,
-												[&signature](std::string_view name) -> std::string_view
+												[&signature, keyId](std::string_view name) -> std::string_view
 												{
+													if (name == "X-Key-Id")
+													{
+														return keyId;
+													}
 													return name == "X-Timestamp"   ? std::string_view("1000")
 														   : name == "X-Signature" ? std::string_view(signature)
 																				   : std::string_view {};
@@ -242,6 +247,123 @@ namespace
 			  "渠道成功失败应答独立于HTTP和存储实现");
 	}
 
+	std::string syntheticJwt(std::string_view encodedHeader)
+	{
+		return std::string(encodedHeader) + "." + "e30" + "." + "c2ln";
+	}
+
+	void testKeySelection()
+	{
+		using namespace gamehub;
+		const std::string current(32, 'c');
+		KeyRotation keys {"current", std::string(32, 'l'), {{"previous", std::string(32, 'p')}}};
+		check(selectVerificationKey(current, keys, "current") == current, "明确标识选择当前密钥");
+		check(selectVerificationKey(current, keys, "previous") == std::string(32, 'p'), "过渡窗口允许旧标识");
+		check(selectVerificationKey(current, keys, "unknown").empty(), "未知标识不能降级为其他密钥");
+		check(selectVerificationKey(current, keys, "") == std::string(32, 'l'), "无标识只走显式旧协议密钥");
+		keys.legacySecret.clear();
+		check(selectVerificationKey(current, keys, "").empty(), "未配置旧协议时拒绝无标识请求");
+		keys.previousKeys.clear();
+		check(selectVerificationKey(current, keys, "previous").empty(), "关闭旧窗口后不再接受旧标识");
+		check(selectVerificationKey(current, {}, "") == current, "原单密钥配置保留兼容");
+		check(selectVerificationKey(current, {}, "current").empty(), "原配置不接受任意标识绕过");
+		check(readJwtKeyId(syntheticJwt("eyJhbGciOiJIUzI1NiIsImtpZCI6Im5ldyJ9")) == "new", "JWT仅提取头部密钥标识");
+		check(readJwtKeyId(syntheticJwt("eyJhbGciOiJIUzI1NiJ9")).empty(), "无kid的JWT保留旧协议选择路径");
+		for (const auto* header : {"!", "eyJraWQiOjF9", "eyJraWQiOiIifQ", "eyJraWQiOiIuLiJ9"})
+		{
+			rejects(
+				[&]
+				{
+					readJwtKeyId(syntheticJwt(header));
+				},
+				"非法JWT头不能参与选密钥");
+		}
+		rejects(
+			[&]
+			{
+				readJwtKeyId(syntheticJwt(std::string(1025, 'e')));
+			},
+			"JWT头解码前限制长度");
+		rejects(
+			[&]
+			{
+				readJwtKeyId(std::string("e30") + "." + "e30");
+			},
+			"JWT必须有三个段");
+		rejects(
+			[&]
+			{
+				readJwtKeyId(syntheticJwt("e30") + ".extra");
+			},
+			"JWT不接受多余段");
+	}
+
+	void testAdapterRotation()
+	{
+		using namespace gamehub;
+		auto game = syntheticGame();
+		game.callbackKeys = {"callback-new", std::string(32, 'l'), {{"callback-old", std::string(32, 'p')}}};
+		game.outboundKeys = {"outbound-new", std::string(32, 'x'), {{"outbound-old", std::string(32, 'y')}}};
+		Config config;
+		config.games = {game};
+		auto registry = createBuiltinCatalog().buildRegistry(config);
+		const auto& channel = registry.channel(game.id, "demo");
+		const std::string body =
+			R"({"bizKey":"rotate","channelOrderId":"rotate","serverId":1,"playerId":"synthetic-player","productId":"test-product","amountMinor":100,"currency":"CNY"})";
+		const auto current = parseSigned(channel, game.callbackSecret, "/callback/demo", body, "callback-new");
+		const auto previous = parseSigned(channel, std::string(32, 'p'), "/callback/demo", body, "callback-old");
+		const auto legacy = parseSigned(channel, std::string(32, 'l'), "/callback/demo", body);
+		check(current.fingerprint == previous.fingerprint && previous.fingerprint == legacy.fingerprint,
+			  "轮换不改变业务身份和摘要");
+		rejects(
+			[&]
+			{
+				parseSigned(channel, game.callbackSecret, "/callback/demo", body, "unknown");
+			},
+			"未知渠道kid即使用当前密钥签名也拒绝");
+		rejects(
+			[&]
+			{
+				parseSigned(channel, game.callbackSecret, "/callback/demo", body);
+			},
+			"当前渠道密钥不能绕过显式legacy路径");
+		const auto& adapter = registry.find(game.id);
+		SignedRequest request {"1000", {}, "GET", "/internal/config/synthetic/1/0", "", "outbound-new"};
+		const auto signature = adapter.signOutbound(request);
+		request.signature = signature;
+		check(adapter.outboundKeyId() == "outbound-new" && adapter.verifyInternalRequest(request, 1000),
+			  "出向使用当前标识且内部请求接受当前签名");
+		request.keyId = {};
+		check(!adapter.verifyInternalRequest(request, 1000), "删除出向kid不能降级通过");
+		request.keyId = "outbound-old";
+		const auto oldSignature =
+			hmacSha256(std::string(32, 'y'),
+					   signatureInput(request.timestamp, request.method, request.path, request.body, request.keyId));
+		request.signature = oldSignature;
+		check(adapter.verifyInternalRequest(request, 1000), "旧内部请求在窗口内可验证");
+		request.keyId = "unknown";
+		check(!adapter.verifyInternalRequest(request, 1000), "未知内部kid不能回退尝试旧密钥");
+		config.games[0].callbackKeys.legacySecret.clear();
+		config.games[0].callbackKeys.previousKeys.clear();
+		registry = createBuiltinCatalog().buildRegistry(config);
+		rejects(
+			[&]
+			{
+				parseSigned(registry.channel(game.id, "demo"), std::string(32, 'l'), "/callback/demo", body);
+			},
+			"关闭legacy窗口后旧无标识请求失效");
+		rejects(
+			[&]
+			{
+				parseSigned(registry.channel(game.id, "demo"),
+							std::string(32, 'p'),
+							"/callback/demo",
+							body,
+							"callback-old");
+			},
+			"移除旧密钥后旧kid失效");
+	}
+
 	struct ConfigFile
 	{
 		std::filesystem::path path =
@@ -282,6 +404,39 @@ namespace
 		}
 	}
 
+	void testRotationConfig(ConfigFile& file, boost::json::object rotating)
+	{
+		auto& auth = rotating.at("auth").as_object();
+		auth["jwtKeyId"] = "jwt-new";
+		auth["jwtPreviousKeys"] = boost::json::array {
+			boost::json::object {{"keyId", "jwt-old"}, {"secretEnv", "GAMEHUB_SYNTHETIC_CONFIG_SECRET"}}};
+		auth["jwtLegacySecretEnv"] = "GAMEHUB_SYNTHETIC_CONFIG_SECRET";
+		auto& game = rotating.at("games").as_array()[0].as_object();
+		game["outboundKeyId"] = "outbound-new";
+		auto& channel = game.at("channels").as_array()[0].as_object();
+		channel["keyId"] = "callback-new";
+		channel["legacySecretEnv"] = "GAMEHUB_SYNTHETIC_CONFIG_SECRET";
+		const auto config = file.load(rotating);
+		check(config.jwtKeys.currentKeyId == "jwt-new" && config.jwtKeys.previousKeys.size() == 1
+				  && !config.jwtKeys.legacySecret.empty() && config.games[0].outboundKeys.currentKeyId == "outbound-new"
+				  && config.games[0].channels[0].keys.currentKeyId == "callback-new",
+			  "三类轮换配置正确读取");
+		auth["jwtPreviousKeys"].as_array()[0].as_object()["keyId"] = "jwt-new";
+		rejectsConfig(
+			[&]
+			{
+				file.load(rotating);
+			},
+			"拒绝当前和旧密钥标识重复");
+		auth.erase("jwtKeyId");
+		rejectsConfig(
+			[&]
+			{
+				file.load(rotating);
+			},
+			"旧密钥配置不能省略当前密钥标识");
+	}
+
 	void testConfigCompatibility()
 	{
 		using namespace gamehub;
@@ -316,6 +471,7 @@ namespace
 				  && config.worker.games == std::vector<std::string> {"synthetic"},
 			  "运行隔离字段正确读取");
 		check(config.games[0].options.at("syntheticSchema").as_string() == "v1", "专用配置保留给适配器工厂检查");
+		testRotationConfig(file, json);
 		json.at("worker").as_object()["games"] = boost::json::array {"missing"};
 		rejectsConfig(
 			[&]
@@ -356,6 +512,8 @@ int main()
 	testBuiltinChannels();
 	testGameRulesSurviveChannelSelection();
 	testIndependentChannelProtocol();
+	testKeySelection();
+	testAdapterRotation();
 	testConfigCompatibility();
 	check(sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 标准向量");
 	check(hmacSha256("key", "The quick brown fox jumps over the lazy dog")

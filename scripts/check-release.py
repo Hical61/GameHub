@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_DIRS = {
-    ".local", "_deps", "out", ".vs", ".idea", ".vscode", ".cache", "__pycache__", "node_modules", "vcpkg_installed",
+    "private", ".local", "_deps", "out", ".vs", ".idea", ".vscode", ".cache", "__pycache__", "node_modules", "vcpkg_installed",
     ".ssh", ".aws", ".azure", ".gnupg", ".kube", ".credentials", "backup", "backups", ".backup", ".backups",
     "dumps", "exports", "raw-data", "raw_data", "data-exports", "data_exports",
 }
@@ -82,12 +82,24 @@ def git_paths(root, *arguments):
     return {item.decode("utf-8", errors="surrogateescape") for item in git_bytes(root, *arguments).split(b"\0") if item}
 
 
+def git_modes(root):
+    """读取暂存区模式，识别真实 Git 符号链接和子模块；未合并的索引拒绝检查。"""
+    modes = {}
+    for entry in git_bytes(root, "ls-files", "--stage", "-z").split(b"\0"):
+        if not entry:
+            continue
+        metadata, separator, path = entry.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[2] != b"0":
+            raise ValueError("暂存区文件模式无效或尚未合并")
+        modes[path.decode("utf-8", errors="surrogateescape")] = fields[0]
+    return modes
+
+
 def forbidden_path(path):
     """检查仓库相对路径，判断它是否属于本地配置、凭据或生成文件。"""
     parts = path.lower().split("/")
     name = parts[-1]
-    if parts[0] == "docs":
-        return True
     if any(part in FORBIDDEN_DIRS or part.startswith("build") for part in parts[:-1]):
         return True
     if name.startswith(".env") and (name == ".env" or name.startswith(".env.")):
@@ -122,6 +134,8 @@ def local_link_exists(source, target, published):
     base = "" if relative.startswith("/") else posixpath.dirname(source)
     normalized = posixpath.normpath(posixpath.join(base, relative.lstrip("/")))
     if normalized == ".." or normalized.startswith("../"):
+        return False
+    if forbidden_path(normalized) or any(part in FORBIDDEN_DIRS for part in normalized.lower().split("/")):
         return False
     return normalized == "." or normalized in published or any(item.startswith(normalized.rstrip("/") + "/") for item in published)
 
@@ -375,15 +389,23 @@ def check_file(path, data, published):
 def check_repository(root, all_files=False):
     """返回仓库的检查结果；默认读取暂存内容，全量模式读取工作区中的候选文件。"""
     tracked = git_paths(root, "ls-files", "--cached", "-z")
+    modes = git_modes(root)
     if all_files:
         paths = git_paths(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
     else:
         paths = git_paths(root, "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z")
-    published = tracked | paths
+    published = {path for path in tracked | paths if not forbidden_path(path)
+                 and modes.get(path) not in (b"120000", b"160000")}
     issues = []
     for path in sorted(paths):
         if forbidden_path(path):
             issues.append((path, 1, "禁止发布的本地文件或产物"))
+            continue
+        if modes.get(path) == b"120000":
+            issues.append((path, 1, "发布文件不能是本地符号链接"))
+            continue
+        if modes.get(path) == b"160000":
+            issues.append((path, 1, "无法检查子模块引用的内容"))
             continue
         try:
             if all_files:

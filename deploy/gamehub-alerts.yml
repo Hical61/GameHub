@@ -16,3 +16,23 @@ groups:
         for: 2m
         annotations:
           summary: 待投递任务超过示例阈值，请检查目标服务和槽位占用。
+      - alert: GameHubTargetFailures
+        expr: sum by (game, server) (rate(gamehub_target_failures_total[5m])) > 0
+        for: 2m
+        annotations:
+          summary: 指定游戏区服持续出现投递失败，请核对目标服务及权威流水。
+      - alert: GameHubLeaseLost
+        expr: sum by (game) (increase(gamehub_delivery_results_total{result="lease_lost"}[5m])) > 0
+        for: 1m
+        annotations:
+          summary: 投递确认时租约失效，请检查数据库延迟、处理时长和租约预算。
+      - alert: GameHubDatabaseErrors
+        expr: sum(rate(gamehub_db_errors_total[5m])) > 0
+        for: 2m
+        annotations:
+          summary: 数据库操作持续报错，请检查连接、超时及死锁类别。
+      - alert: GameHubGamePendingTooLong
+        expr: max by (game) (gamehub_game_oldest_pending_seconds) > 60
+        for: 2m
+        annotations:
+          summary: 指定游戏积压过久，请检查运行范围、暂停状态与目标服务。

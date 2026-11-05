@@ -1,4 +1,4 @@
--- GameHub 0.1 建表脚本。用迁移账号在 Hub 独立数据库中执行，运行账号不需要 DDL 权限。
+-- GameHub 基础建表脚本。用迁移账号在 Hub 独立数据库中执行，运行账号不需要 DDL 权限。
 -- 标识按 ASCII 区分大小写；时间由数据库生成，统一用 UTC。
 CREATE TABLE schema_version (
     version INT UNSIGNED NOT NULL PRIMARY KEY,

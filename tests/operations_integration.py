@@ -14,95 +14,179 @@ import integration
 
 
 class UpgradeFixture(Fixture):
-    """覆盖版本 1、旧版本 2 的存量升级及完成后的重复执行拒绝。"""
+    """覆盖基础初始化、归档统计和多游戏统计阶段的存量升级及完整迁移的首错拒绝。"""
 
-    migration_boundary = "-- 多游戏结构升级：从版本 2 到版本 3。"
+    migration_boundary = "-- 多游戏计数：建立按游戏划分的计数分片与索引。"
+    observability_boundary = "-- 投递观测与运行控制：记录投递尝试、配置回执和游戏运行控制。"
 
     def sql(self, sql, timeout=10):
+        """拦截本次建库和合并迁移；返回 SQL 结果，其余操作沿用隔离实例保护。"""
         if "CREATE TABLE schema_version" in sql:
             result = super().sql(sql, timeout=timeout)
             self.seed_v1("gamehub")
             return result
         if self.migration_boundary not in sql:
             return super().sql(sql, timeout=timeout)
-        self.verify_v1_upgrade(sql)
-        # 先执行原版本 2 阶段，构造有真实全局计数触发器和归档数据的旧库。
+        self.verify_legacy_upgrade(sql, 1)
+        self.verify_legacy_upgrade(sql, 3)
+        # 先执行归档统计阶段，构造有真实全局计数触发器和归档数据的合成库。
         legacy_stage = sql.split(self.migration_boundary, 1)[0]
         super().sql(legacy_stage, timeout=timeout)
         self.archive_seed("gamehub")
+        assert super().sql("SELECT MAX(version) FROM gamehub.schema_version") == "2"
         before = self.task_counts("gamehub", "delivery_task_counts")
-        assert before == "1\t1\t0\t1\t1", "旧版本 2 测试库未包含预期活动与归档数据"
+        assert before == "1\t1\t1\t1\t1", "归档统计测试库未包含四种活动状态及归档数据"
+        history = self.history_snapshot("gamehub", 2)
         result = super().sql(sql, timeout=timeout)
-        self.verify_seed("gamehub", before)
-        self.verify_repeat_rejected("gamehub", sql)
-        print("通过：合并迁移兼容存量版本 1/2、活动与归档计数及完成后重复拒绝")
+        self.verify_upgrade("gamehub", before, history, sql)
+        print("通过：归档统计阶段执行完整升级，四状态、归档、计数及历史内容保留")
         return result
 
+    def verify_upgrade(self, database, counts, history, migration):
+        """核对指定库升级后的历史、计数、运行维护表和触发器，并验证完整迁移重复拒绝。"""
+        assert super().sql(f"SELECT MAX(version) FROM {database}.schema_version") == "4"
+        versions = super().sql(f"SELECT version FROM {database}.schema_version ORDER BY version")
+        assert versions.splitlines() == ["1", "2", "3", "4"], "合并迁移没有保留完整版本记录"
+        current = self.history_snapshot(database, 4)
+        assert all(current[name] == value for name, value in history.items()), "合并迁移修改了历史内容或已有计数分片"
+        assert self.task_counts(database, "delivery_task_counts") == counts, "全局计数未保留"
+        assert self.task_counts(database, "game_delivery_task_counts") == counts, "游戏计数未正确保留或回填"
+        versions = super().sql("SELECT COUNT(*) FROM " + database + ".hub_event "
+                               "WHERE payload_version<>1 OR fingerprint_version<>1")
+        assert versions == "0", "合并迁移修改了历史载荷或摘要的默认版本"
+        for table in ("delivery_attempt", "config_server_state", "game_delivery_control"):
+            assert super().sql(f"SELECT COUNT(*) FROM {database}.{table}") == "0", "升级伪造了已有任务的运行历史"
+        self.verify_trigger_order(database)
+        self.verify_repeat_rejected(database, migration)
+
     def seed_v1(self, database):
-        """给本次固定测试库插入四种状态，不涉及已有数据库。"""
+        """插入合成历史和五条任务，四状态齐全并多留一条 done 供归档测试。"""
         super().sql(f"INSERT INTO {database}.hub_event(game_id,task_type,namespace_key,biz_key,request_hash,payload,created_at) "
-                "VALUES('demo','announce','migration','upgrade-seed',REPEAT('0',64),'{}',UTC_TIMESTAMP(6)); "
+                "VALUES('demo','announce','migration','upgrade-seed',REPEAT('0',64),"
+                "'{\"note\":\"upgrade-history\",\"amountMinor\":1234,\"nested\":{\"keep\":true}}',UTC_TIMESTAMP(6)); "
                 f"SET @upgrade_event=LAST_INSERT_ID(); INSERT INTO {database}.delivery_task"
                 "(event_id,game_id,server_id,status,next_retry_at,lease_until,created_at,updated_at) "
-                "SELECT @upgrade_event,'demo',900000+s.n,s.n,TIMESTAMPADD(DAY,1,UTC_TIMESTAMP(6)),"
+                "SELECT @upgrade_event,'demo',900000+s.n,IF(s.n=4,2,s.n),TIMESTAMPADD(DAY,1,UTC_TIMESTAMP(6)),"
                 "TIMESTAMPADD(DAY,1,UTC_TIMESTAMP(6)),UTC_TIMESTAMP(6),UTC_TIMESTAMP(6) "
-                "FROM (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) s")
+                "FROM (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) s")
 
     def archive_seed(self, database):
-        """在旧版本 2 将一条 done 移入归档，保留真实计数变化。"""
+        """在具备归档统计结构的合成库将额外的 done 移入归档，保留四种活动状态和真实计数。"""
         super().sql(f"USE {database}; START TRANSACTION; INSERT INTO delivery_task_archive "
                 "SELECT t.*,UTC_TIMESTAMP(6) FROM delivery_task t JOIN hub_event e ON e.id=t.event_id "
-                "WHERE e.biz_key='upgrade-seed' AND t.status=2; "
+                "WHERE e.biz_key='upgrade-seed' AND t.server_id=900004 AND t.status=2; "
                 "DELETE t FROM delivery_task t JOIN hub_event e ON e.id=t.event_id "
-                "WHERE e.biz_key='upgrade-seed' AND t.status=2; COMMIT")
+                "WHERE e.biz_key='upgrade-seed' AND t.server_id=900004 AND t.status=2; COMMIT")
 
     def task_counts(self, database, table):
         """返回测试计数表的五种汇总，仅供迁移前后比较。"""
         return super().sql("SELECT SUM(pending_count),SUM(delivering_count),SUM(done_count),"
                            f"SUM(failed_count),SUM(archived_count) FROM {database}.{table}")
 
-    def verify_seed(self, database, counts):
-        """确认历史正文、摘要、默认版本及两套计数均保留。"""
-        previous = super().sql("SELECT payload_version,fingerprint_version,request_hash,JSON_LENGTH(payload) "
-                               f"FROM {database}.hub_event WHERE biz_key='upgrade-seed'")
-        assert previous == "1\t1\t" + "0" * 64 + "\t0", "合并迁移修改了历史摘要、载荷或默认版本"
-        assert super().sql(f"SELECT MAX(version) FROM {database}.schema_version") == "3"
-        assert self.task_counts(database, "delivery_task_counts") == counts, "全局计数未保留"
-        assert self.task_counts(database, "game_delivery_task_counts") == counts, "游戏计数未正确回填"
+    def history_snapshot(self, database, version):
+        """返回合成事件和任务的完整基础字段；基础初始化不含归档表，按空归档比较。"""
+        events = super().sql("SELECT id,game_id,task_type,namespace_key,biz_key,request_hash,"
+                             f"CAST(payload AS CHAR),created_at FROM {database}.hub_event ORDER BY id")
+        tasks = super().sql(f"SELECT * FROM {database}.delivery_task ORDER BY id")
+        archive = super().sql(f"SELECT * FROM {database}.delivery_task_archive ORDER BY id") if version >= 2 else ""
+        redaction_column = "payload_redacted_at" if version >= 2 else "NULL"
+        redactions = super().sql(f"SELECT id,{redaction_column} FROM {database}.hub_event ORDER BY id")
+        history = {"events": events, "tasks": tasks, "archive": archive, "redactions": redactions}
+        if version >= 2:
+            history["globalCounts"] = super().sql(f"SELECT * FROM {database}.delivery_task_counts ORDER BY bucket_id")
+        if version >= 3:
+            history["gameCounts"] = super().sql(f"SELECT * FROM {database}.game_delivery_task_counts ORDER BY game_id,bucket_id")
+            history["versions"] = super().sql(f"SELECT id,payload_version,fingerprint_version FROM {database}.hub_event ORDER BY id")
+        return history
 
-    def verify_v1_upgrade(self, migration):
-        """独立辅助库带四状态数据，直接执行整份合并迁移。"""
-        database = "gamehub_from_v1"
+    def verify_legacy_upgrade(self, migration, version):
+        """从职责阶段构造辅助库，再直接执行整份运行维护迁移。"""
+        database = f"gamehub_from_v{version}"
         initial = (integration.ROOT / "migrations/001_initial.sql").read_text(encoding="utf-8")
         super().sql(f"CREATE DATABASE {database} CHARACTER SET utf8mb4; USE {database};\n" + initial)
         self.seed_v1(database)
         migration = migration.replace("USE gamehub;", f"USE {database};", 1)
+        counts = "1\t1\t2\t1\t0"
+        if version == 3:
+            assert self.observability_boundary in migration, "合并迁移缺少投递观测与运行控制的阶段边界"
+            super().sql(migration.split(self.observability_boundary, 1)[0])
+            self.archive_seed(database)
+            counts = "1\t1\t1\t1\t1"
+            assert self.task_counts(database, "delivery_task_counts") == counts
+            assert self.task_counts(database, "game_delivery_task_counts") == counts
+        assert super().sql(f"SELECT MAX(version) FROM {database}.schema_version") == str(version)
+        history = self.history_snapshot(database, version)
         super().sql(migration)
-        self.verify_seed(database, "1\t1\t1\t1\t0")
-        self.verify_repeat_rejected(database, migration)
+        self.verify_upgrade(database, counts, history, migration)
+        if version == 3:
+            self.verify_appended_stage(database, migration)
         super().sql(f"DROP DATABASE {database}")
+        stage = "基础初始化" if version == 1 else "多游戏统计阶段"
+        print(f"通过：{stage}执行完整升级，历史及计数保留，投递观测与运行控制三表为空")
+
+    def verify_appended_stage(self, database, migration):
+        """只在辅助库模拟追加迁移，确认已完成阶段允许后续结构变更继续执行。"""
+        target_setting = "SET @gamehub_target_version = 4;"
+        assert migration.count(target_setting) == 1, "累计迁移目标版本必须由唯一入口设置"
+        future = migration.replace(target_setting, "SET @gamehub_target_version = 5;", 1)
+        future += "\nSET @gamehub_source_version = (SELECT MAX(version) FROM schema_version);\n"
+        future += ("SET @gamehub_migration_sql = IF(@gamehub_source_version=4,"
+                   "'CREATE TABLE synthetic_upgrade_append (marker INT NOT NULL PRIMARY KEY) ENGINE=InnoDB','DO 0');\n"
+                   "PREPARE gamehub_migration_step FROM @gamehub_migration_sql;\n"
+                   "EXECUTE gamehub_migration_step;\nDEALLOCATE PREPARE gamehub_migration_step;\n"
+                   "INSERT INTO schema_version(version,installed_at) "
+                   "SELECT 5,UTC_TIMESTAMP(6) WHERE @gamehub_source_version=4;\n")
+        tables = super().sql("SELECT TABLE_NAME FROM information_schema.TABLES "
+                             f"WHERE TABLE_SCHEMA='{database}' AND TABLE_NAME<>'schema_version' ORDER BY TABLE_NAME").splitlines()
+        before = self.table_checksums(database, tables)
+        versions = super().sql(f"SELECT * FROM {database}.schema_version ORDER BY version")
+        super().sql(future)
+        assert super().sql(f"SELECT MAX(version) FROM {database}.schema_version") == "5"
+        assert super().sql(f"SELECT * FROM {database}.schema_version WHERE version<=4 ORDER BY version") == versions
+        assert self.table_checksums(database, tables) == before, "追加阶段修改了原有业务内容或计数"
+        assert super().sql(f"SELECT COUNT(*) FROM {database}.synthetic_upgrade_append") == "0"
+        self.verify_trigger_order(database)
+        self.verify_repeat_rejected(database, future, version=5)
+        print("通过：仅辅助库模拟追加迁移，已有阶段跳过、历史保留且重复执行首错拒绝")
+
+    def verify_trigger_order(self, database):
+        """逐对确认游戏计数触发器始终在对应全局触发器之后执行。"""
+        rows = super().sql("SELECT TRIGGER_NAME,ACTION_ORDER FROM information_schema.TRIGGERS "
+                            f"WHERE TRIGGER_SCHEMA='{database}' ORDER BY TRIGGER_NAME")
+        orders = {name: int(order) for name, order in (row.split("\t") for row in rows.splitlines())}
+        for name in ("task_count_insert", "task_count_update", "task_count_delete",
+                     "archive_count_insert", "archive_count_delete"):
+            assert orders["hub_" + name] < orders["hub_game_" + name], "全局和游戏计数触发器执行顺序颠倒"
 
     def snapshot_schema(self, database):
-        """比较本次库的表内容校验和与对象定义数量，不输出业务正文。"""
+        """返回表内容校验和、完整建表定义和触发器定义，仅在内存中比较。"""
         tables = super().sql("SELECT TABLE_NAME FROM information_schema.TABLES "
                              f"WHERE TABLE_SCHEMA='{database}' ORDER BY TABLE_NAME").splitlines()
+        checksum = self.table_checksums(database, tables)
+        definitions = super().sql("; ".join(f"SHOW CREATE TABLE {database}.{table}" for table in tables))
+        triggers = super().sql("SELECT TRIGGER_NAME,EVENT_MANIPULATION,ACTION_TIMING,ACTION_ORDER,ACTION_STATEMENT "
+                               "FROM information_schema.TRIGGERS "
+                               f"WHERE TRIGGER_SCHEMA='{database}' ORDER BY TRIGGER_NAME")
+        return checksum, definitions, triggers
+
+    def table_checksums(self, database, tables):
+        """计算指定隔离表的内容校验和，返回文本；任一表无法校验时立即失败。"""
         checksum = super().sql("CHECKSUM TABLE " + ",".join(f"{database}.{table}" for table in tables))
         assert all(re.fullmatch(r"[^\t]+\t\d+", line) for line in checksum.splitlines()), "表内容校验和不可用"
-        objects = super().sql("SELECT COUNT(*) FROM information_schema.COLUMNS "
-                              f"WHERE TABLE_SCHEMA='{database}'; "
-                              "SELECT TRIGGER_NAME,ACTION_ORDER FROM information_schema.TRIGGERS "
-                              f"WHERE TRIGGER_SCHEMA='{database}' ORDER BY TRIGGER_NAME")
-        return checksum, objects
+        return checksum
 
-    def verify_repeat_rejected(self, database, migration):
+    def verify_repeat_rejected(self, database, migration, version=4):
         """已完成版本再次执行须在 DDL 前拒绝，保留所有表内容及触发器。"""
         before = self.snapshot_schema(database)
         try:
             super().sql(migration)
         except RuntimeError:
-            pass
+            error = self.sql_errors[-1]
+            # Fixture.sql 在输入前添加一行实例身份检查；错误必须来自首个版本守卫。
+            guard_line = migration[:migration.index("PREPARE gamehub_migration_guard")].count("\n") + 2
+            assert error["code"] == 1064 and error["line"] == guard_line, f"版本 {version} 没有在首个版本守卫拒绝"
         else:
-            raise AssertionError("版本 3 未拒绝重复执行合并迁移")
+            raise AssertionError(f"版本 {version} 未拒绝重复执行合并迁移")
         assert self.snapshot_schema(database) == before, "拒绝重复迁移时修改了已完成的库"
 
 
@@ -122,8 +206,14 @@ def counts_match(fixture):
     assert report["completedTotal"] == actual["done"] + archived
     game_status, game_report = fixture.request("GET", "/admin/stats/demo", admin=fixture.admin())
     assert game_status == 200
-    assert all(game_report[key] == value for key, value in actual.items()), "按游戏事务计数与升级后任务不一致"
-    assert game_report["archivedDone"] == archived
+    # 存储回归包含其他游戏的计数样本，游戏接口必须和同一范围的实际任务比较。
+    game_actual = dict.fromkeys(names, 0)
+    for line in fixture.sql("SELECT status,COUNT(*) FROM gamehub.delivery_task WHERE game_id='demo' GROUP BY status").splitlines():
+        state, count = map(int, line.split("\t"))
+        game_actual[names[state]] = count
+    game_archived = int(fixture.sql("SELECT COUNT(*) FROM gamehub.delivery_task_archive WHERE game_id='demo'"))
+    assert all(game_report[key] == value for key, value in game_actual.items()), "按游戏事务计数与升级后任务不一致"
+    assert game_report["archivedDone"] == game_archived
 
 
 def archive(fixture, batch=1, redact=False):
@@ -376,7 +466,7 @@ def verify_counter_deadlock_retry(fixture):
 
 
 def benchmark_stats(fixture, rows, output):
-    """在同一批合成历史上比较全扫描与新统计 SQL，写入条件和原始耗时。"""
+    """在同一批合成历史上比较全扫描与事务计数 SQL，写入条件和原始耗时。"""
     fixture._stop_child(fixture.hub)
     fixture.sql("INSERT INTO gamehub.hub_event(game_id,task_type,namespace_key,biz_key,request_hash,payload,created_at) "
                 "VALUES('demo','announce','benchmark','stats-seed',REPEAT('0',64),'{}',UTC_TIMESTAMP(6))")

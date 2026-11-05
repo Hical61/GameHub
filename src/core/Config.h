@@ -12,6 +12,28 @@
 
 namespace gamehub
 {
+	inline constexpr std::size_t kMaxKeyIdLength = 64;
+	inline constexpr std::size_t kMaxPreviousVerificationKeys = 8;
+
+	struct VerificationKey
+	{
+		std::string keyId;
+		std::string secret;
+	};
+
+	struct KeyRotation
+	{
+		std::string currentKeyId;
+		// 仅用于无 key-id 的旧协议；启用轮换后，不默认使用当前密钥验证无 key-id 请求。
+		std::string legacySecret;
+		std::vector<VerificationKey> previousKeys;
+	};
+
+	/// @param currentSecret 当前密钥；rotation 轮换窗口；keyId 请求指定的密钥标识。@return 唯一选中的密钥；未知标识或未开放旧协议时返回空视图。
+	std::string_view selectVerificationKey(std::string_view currentSecret,
+										   const KeyRotation& rotation,
+										   std::string_view keyId);
+
 	class ConfigError : public std::runtime_error
 	{
 	public:
@@ -36,6 +58,7 @@ namespace gamehub
 		std::string nameSpace;
 		std::string secret;
 		boost::json::object options;
+		KeyRotation keys;
 	};
 
 	struct GameConfig
@@ -52,6 +75,8 @@ namespace gamehub
 		unsigned callbackRatePerSecond = 100;
 		unsigned callbackBurst = 200;
 		boost::json::object options;
+		KeyRotation callbackKeys;
+		KeyRotation outboundKeys;
 		/// @param serverId 区服编号。@return 对应的目标地址；未配置时抛 ApiError。
 		const ServerEndpoint& endpoint(std::uint32_t serverId) const;
 	};
@@ -71,6 +96,7 @@ namespace gamehub
 		std::size_t maxResponseBodyBytes = kDefaultMaxResponseBodyBytes;
 		// 空列表表示处理全部配置游戏；非空时领取及回收均仅处理这些游戏。
 		std::vector<std::string> games;
+		unsigned maxTasksPerTick = 16;
 	};
 
 	struct Config
@@ -90,6 +116,7 @@ namespace gamehub
 		std::string jwtAudience;
 		WorkerConfig worker;
 		std::vector<GameConfig> games;
+		KeyRotation jwtKeys;
 		/// @param gameId 游戏标识。@return 对应的游戏配置；未配置时抛 ApiError。
 		const GameConfig& game(std::string_view gameId) const;
 	};

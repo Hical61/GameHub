@@ -21,7 +21,7 @@ int main(int argc, char** argv)
 		if (argc < 3 || std::string_view(argv[1]) != "--config" || argc > 4
 			|| (argc == 4 && std::string_view(argv[3]) != "--check-config"))
 		{
-			HICAL_LOG_INFO("用法：gamehub --config config/gamehub.json [--check-config]，或 gamehub --version");
+			HICAL_LOG_INFO("用法：gamehub --config private/config/gamehub.json [--check-config]，或 gamehub --version");
 			return argc == 2 && std::string_view(argv[1]) == "--help" ? 0 : 2;
 		}
 		auto config = gamehub::loadConfig(argv[2]);

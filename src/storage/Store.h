@@ -18,6 +18,26 @@ namespace gamehub
 		bool duplicate = false;
 	};
 
+	struct TaskFilter
+	{
+		std::uint64_t after = 0;
+		unsigned limit = 100;
+		std::optional<TaskStatus> status;
+		std::optional<std::uint32_t> serverId;
+		// UTC Unix 秒；起始时间包含，结束时间不包含。
+		std::optional<std::int64_t> createdFrom;
+		std::optional<std::int64_t> createdBefore;
+	};
+
+	struct DeliveryControl
+	{
+		std::string gameId;
+		std::uint64_t version = 0;
+		bool enabled = true;
+		unsigned maxConcurrentDeliveries = 0;
+		unsigned maxConcurrentPerServer = 0;
+	};
+
 	class Store
 	{
 	public:
@@ -52,6 +72,18 @@ namespace gamehub
 							   unsigned maxAttempts);
 		/// @param gameId 游戏标识；after ID 游标。@return 最多 100 条任务，不返回订单内容。
 		Awaitable<boost::json::array> listTasks(std::string gameId, std::uint64_t after);
+		/// @param gameId 游戏；filter 有界游标、状态、区服及 UTC 创建时间范围。@return 任务元信息，不包含业务载荷。
+		Awaitable<boost::json::array> listTasks(std::string gameId, TaskFilter filter);
+		/// @param gameId/taskType/nameSpace/bizKey 完整业务身份。@return 事件与活动/归档任务元信息；未找到抛 404。
+		Awaitable<boost::json::object> lookupEvent(std::string gameId,
+												   std::string taskType,
+												   std::string nameSpace,
+												   std::string bizKey);
+		/// @param gameId 游戏；taskId 任务；after 尝试记录游标；limit 为 1 到 100。@return 无业务载荷的持久尝试历史。
+		Awaitable<boost::json::array> listAttempts(std::string gameId,
+												   std::uint64_t taskId,
+												   std::uint64_t after = 0,
+												   unsigned limit = 100);
 		/// @param gameId 游戏标识；after ID 游标。@return 最多 100 条已归档任务的元信息，不返回载荷。
 		Awaitable<boost::json::array> listArchived(std::string gameId, std::uint64_t after);
 		/// @param gameId 游戏标识；taskId 任务编号；actor 操作人。@return 是否将 failed 任务重排；状态更新和审计写在同一事务中。
@@ -60,6 +92,8 @@ namespace gamehub
 		Awaitable<boost::json::object> stats();
 		/// @param gameId 游戏标识。@return 该游戏的状态计数与最老积压，最多汇总 64 个计数分片。
 		Awaitable<boost::json::object> stats(std::string gameId);
+		/// @param gameIds 至多 100 款固定配置游戏，空数组不查询。@return 单次 SQL 汇总各游戏状态和最老积压，无任务时返回零值。
+		Awaitable<boost::json::array> gameStats(std::vector<std::string> gameIds);
 		/// @param gameId 游戏；keepDays 保留天数；batchSize 单批上限；actor 操作者。
 		/// @return 本次原子移入归档表的 done 任务数；幂等事件和审计记录保留。
 		Awaitable<std::uint64_t> archiveDone(std::string gameId,
@@ -76,6 +110,23 @@ namespace gamehub
 		Awaitable<AcceptResult> publishConfig(Submission submission, std::uint64_t version, std::string content);
 		/// @param gameId 游戏标识；version 为 0 时读取最新版本。@return 指定版本的配置；不存在时抛 404。
 		Awaitable<boost::json::object> readConfig(std::string gameId, std::uint64_t version);
+		/// @param gameId/serverId 已授权的游戏与区服；version 已应用版本；contentHash 内容摘要。@return 持久应用状态；旧版本或摘要不符抛 409。
+		Awaitable<boost::json::object> reportConfigApplied(std::string gameId,
+														   std::uint32_t serverId,
+														   std::uint64_t version,
+														   std::string contentHash);
+		/// @param gameId 游戏；afterServer 区服游标；limit 为 1 到 100。@return 逐服已应用版本和摘要，不包含配置正文。
+		Awaitable<boost::json::array> listConfigStates(std::string gameId,
+													   std::uint32_t afterServer = 0,
+													   unsigned limit = 100);
+		/// @param gameId 游戏。@return 持久控制覆盖；没有记录时沿用启动配置。
+		Awaitable<std::optional<DeliveryControl>> readDeliveryControl(std::string gameId);
+		/// @param gameIds 本进程关心的至多 100 款游戏；空数组不查询。@return 已存在的控制覆盖。
+		Awaitable<std::vector<DeliveryControl>> readDeliveryControls(std::vector<std::string> gameIds);
+		/// @param desired 新值；expectedVersion 期望版本，0 表示首次创建；actor 操作人。@return 自动递增版本后的控制；冲突抛 409，更新与审计同事务。
+		Awaitable<DeliveryControl> updateDeliveryControl(DeliveryControl desired,
+														 std::uint64_t expectedVersion,
+														 std::string actor);
 		/// @param gameId 游戏标识；after ID 游标。@return 最多 100 条审计记录，不返回业务内容。
 		Awaitable<boost::json::array> listAudit(std::string gameId, std::uint64_t after);
 

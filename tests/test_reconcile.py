@@ -1,10 +1,12 @@
 """验证两段对账能区分缺记录、确认丢失、金额冲突和重复流水。"""
 
 import importlib.util
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -98,6 +100,41 @@ class ReconcileTests(unittest.TestCase):
         result = subprocess.run(command + [str(alias)], capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 1)
         self.assertEqual([path.read_bytes() for path in inputs], before)
+
+    def test_hub_identity_isolates_namespace_and_target(self):
+        first = {"gameId": "demo", "taskType": "payment", "namespace": "merchant-a", "bizKey": "order",
+                 "serverId": 1, "amountMinor": 100, "currency": "CNY", "status": "done"}
+        second = dict(first, namespace="merchant-b")
+        report = RECONCILE.reconcile([first, second], [first, second], [first])
+        self.assertEqual(report["identityMode"], "hub-v2")
+        self.assertEqual(report["categoryCounts"], {"hub_done_without_ledger": 1})
+        self.assertNotEqual(RECONCILE.identity(first), RECONCILE.identity(dict(first, serverId=2)))
+
+    def test_legacy_and_hub_identity_cannot_mix(self):
+        modern = {"gameId": "demo", "taskType": "payment", "namespace": "merchant", "bizKey": "order", "serverId": 1}
+        with self.assertRaises(ValueError):
+            RECONCILE.reconcile([row()], [modern], [])
+
+    def test_complete_window_required_for_export_envelope(self):
+        metadata = {"windowStart": "2026-11-01T00:00:00Z", "windowEnd": "2026-11-02T00:00:00Z",
+                    "watermark": "2026-11-02T01:00:00Z"}
+        path = self.directory / "export.json"
+        path.write_text(json.dumps({"formatVersion": 2, **metadata, "records": [row(status="done")]}), encoding="utf-8")
+        self.assertEqual(RECONCILE.load_export(path)[1], metadata)
+        with self.assertRaises(ValueError):
+            RECONCILE.validate_window(dict(metadata, watermark="2026-11-01T20:00:00Z"))
+
+    def test_case_ledger_repeated_run_preserves_disposition_and_count(self):
+        report = RECONCILE.reconcile([row()], [], [])
+        database = self.directory / "cases.sqlite"
+        RECONCILE.record_cases(database, report)
+        issue = report["issues"][0]
+        RECONCILE.record_cases(database, None, (issue["reference"], issue["category"], "resolved"))
+        RECONCILE.record_cases(database, report)
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT state,observations FROM cases").fetchone(), ("resolved", 1))
+            self.assertEqual(connection.execute("SELECT count(*) FROM runs").fetchone(), (1,))
+        self.assertNotIn("synthetic-order", database.read_bytes().decode("utf-8", errors="ignore"))
 
 
 if __name__ == "__main__":

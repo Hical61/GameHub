@@ -73,14 +73,14 @@ class HistoryChecks(unittest.TestCase):
         )
         return result.returncode, (result.stdout + result.stderr).decode("utf-8", errors="replace")
 
-    def test_removed_docs_are_still_rejected(self):
-        self.write("docs/private.md", "synthetic notes\n")
+    def test_removed_private_docs_are_still_rejected(self):
+        self.write("private/docs/notes.md", "synthetic notes\n")
         self.commit()
-        self.git("rm", "docs/private.md")
+        self.git("rm", "private/docs/notes.md")
         self.write("README.md", "public\n")
         self.commit()
         issues = CHECK.check_repository(self.root)
-        self.assertIn(("docs/private.md", 1, "禁止发布的本地文件或产物"), {item[1:] for item in issues})
+        self.assertIn(("private/docs/notes.md", 1, "禁止发布的本地文件或产物"), {item[1:] for item in issues})
         self.assertEqual(self.run_checker()[0], 1)
 
     def test_orphan_tree_reference_is_checked_and_explicit_scope_is_honored(self):
@@ -89,7 +89,7 @@ class HistoryChecks(unittest.TestCase):
         branch = self.git("symbolic-ref", "HEAD").decode().strip()
         blob = self.git("hash-object", "-w", "--stdin", input=b"synthetic notes\n").strip()
         child = self.git("mktree", input=b"100644 blob " + blob + b"\tprivate.md\n").strip()
-        tree = self.git("mktree", input=b"040000 tree " + child + b"\tdocs\n").strip()
+        tree = self.git("mktree", input=b"040000 tree " + child + b"\tprivate\n").strip()
         self.git("update-ref", "refs/private/snapshot", tree.decode())
         self.assertTrue(CHECK.check_repository(self.root))
         self.assertEqual(CHECK.check_repository(self.root, [branch]), [])
@@ -246,15 +246,32 @@ class HistoryChecks(unittest.TestCase):
             with self.subTest(example=example):
                 self.assertEqual(CHECK.message_issues("@commit-message.txt", ("synthetic message\n\n" + example).encode()), [])
 
-    def test_links_use_each_snapshot_and_exclude_forbidden_docs(self):
-        self.write("README.md", "[guide](docs/guide.md)\n[future](future.md)\n")
-        self.write("docs/guide.md", "synthetic guide\n")
+    def test_links_use_each_snapshot_and_exclude_private_docs(self):
+        self.write("README.md", "[guide](private/docs/guide.md)\n[future](future.md)\n")
+        self.write("private/docs/guide.md", "synthetic guide\n")
         self.commit()
         self.write("future.md", "public\n")
         self.commit()
         issues = CHECK.check_repository(self.root)
         broken = {line for _object_id, path, line, category in issues if path == "README.md" and category == "本地链接目标未纳入发布文件"}
         self.assertEqual(broken, {1, 2})
+
+    def test_public_docs_are_allowed_in_history(self):
+        self.write("README.md", "[guide](docs/README.md)\n")
+        self.write("docs/README.md", "synthetic public guide\n")
+        self.commit()
+        self.assertEqual(CHECK.check_repository(self.root), [])
+
+    def test_removed_public_symlink_to_private_is_still_rejected(self):
+        self.write("README.md", "public\n")
+        self.git("add", "README.md")
+        blob = self.git("hash-object", "-w", "--stdin", input=b"private/adapters/SyntheticAdapter.cpp").strip().decode()
+        self.git("update-index", "--add", "--cacheinfo", "120000", blob, "adapter-link.cpp")
+        self.git("commit", "--quiet", "--file=-", input=b"synthetic link snapshot\n")
+        self.git("rm", "--cached", "adapter-link.cpp")
+        self.git("commit", "--quiet", "--file=-", input=b"remove synthetic link\n")
+        issues = CHECK.check_repository(self.root)
+        self.assertIn(("adapter-link.cpp", 1, "发布文件不能是本地符号链接"), {item[1:] for item in issues})
 
     def test_annotated_tag_identity_and_message_are_checked(self):
         self.write("README.md", "public\n")
@@ -289,7 +306,7 @@ class HistoryChecks(unittest.TestCase):
         self.write("README.md", "public\n")
         self.commit()
         self.git("checkout", "--detach", "--quiet")
-        self.write("docs/detached.md", "synthetic detached notes\n")
+        self.write("private/docs/detached.md", "synthetic detached notes\n")
         self.commit()
         self.assertTrue(CHECK.check_repository(self.root))
 

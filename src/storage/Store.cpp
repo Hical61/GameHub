@@ -3,6 +3,8 @@
  */
 #include "Store.h"
 #include "core/Crypto.h"
+#include <algorithm>
+#include <array>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -99,16 +101,35 @@ namespace gamehub
 				throw ApiError(400, "保留天数或单批数量超出范围");
 			}
 		}
+
+		std::string fixedDeliveryError(bool success, std::string error)
+		{
+			if (success)
+			{
+				return {};
+			}
+			constexpr std::array<std::string_view, 5> allowed {"network_error",
+															   "network_timeout",
+															   "invalid_ack",
+															   "response_too_large",
+															   "delivery_exception"};
+			const bool httpStatus = error.size() == 8 && error.starts_with("http_") && error[5] >= '1'
+									&& error[5] <= '5' && error[6] >= '0' && error[6] <= '9' && error[7] >= '0'
+									&& error[7] <= '9';
+			return httpStatus || std::find(allowed.begin(), allowed.end(), error) != allowed.end()
+					   ? error
+					   : "delivery_exception";
+		}
 	} // namespace
 
 	Awaitable<void> Store::checkSchema()
 	{
 		auto session = co_await database_->acquire();
 		auto result = co_await session.query("SELECT MAX(version) FROM schema_version");
-		constexpr std::uint64_t kSchemaVersion = 3;
+		constexpr std::uint64_t kSchemaVersion = 4;
 		if (result.rows().empty() || result.rows()[0][0].is_null() || number(result.rows()[0][0]) != kSchemaVersion)
 		{
-			throw std::runtime_error("数据库迁移版本不匹配，当前程序要求版本 3");
+			throw std::runtime_error("数据库结构与当前程序不匹配，请执行配套迁移脚本");
 		}
 		co_await session.query("SELECT e.id,t.generation,c.version,a.id FROM hub_event e "
 							   "LEFT JOIN delivery_task t ON t.event_id=e.id "
@@ -119,6 +140,10 @@ namespace gamehub
 			"SELECT id,payload_redacted_at,payload_version,fingerprint_version FROM hub_event LIMIT 0");
 		co_await session.query("SELECT id FROM delivery_task_archive LIMIT 0");
 		co_await session.query("SELECT game_id,bucket_id,pending_count FROM game_delivery_task_counts LIMIT 0");
+		co_await session.query("SELECT task_id,generation,outcome FROM delivery_attempt LIMIT 0");
+		co_await session.query("SELECT game_id,server_id,version,content_hash FROM config_server_state LIMIT 0");
+		co_await session.query("SELECT game_id,version,enabled,max_concurrent_deliveries,max_concurrent_per_server "
+							   "FROM game_delivery_control LIMIT 0");
 	}
 
 	Awaitable<void> Store::audit(DbSession& session,
@@ -265,7 +290,8 @@ namespace gamehub
 		auto session = co_await database_->acquire();
 		co_await session.query("START TRANSACTION");
 		// 性能敏感：游戏范围沿 idx_game_pending 领取；满额目标在 SQL 中排除，不先领取再退回。
-		std::string sql = "SELECT id,event_id,game_id,server_id,attempts,generation FROM delivery_task ";
+		std::string sql = "SELECT id,event_id,game_id,server_id,attempts,generation,"
+						  "TIMESTAMPDIFF(MICROSECOND,'1970-01-01 00:00:00',created_at) FROM delivery_task ";
 		sql += gameId ? "FORCE INDEX(idx_game_pending) WHERE game_id=? AND " : "WHERE ";
 		sql += "status=0 AND next_retry_at<=UTC_TIMESTAMP(6) ";
 		std::vector<std::string> params;
@@ -308,6 +334,7 @@ namespace gamehub
 		task.attempts = static_cast<unsigned>(number(row[4])) + 1;
 		task.generation = number(row[5]) + 1;
 		task.eventId = number(row[1]);
+		task.createdAtUnixMicros = row[6].as_int64();
 		std::vector<std::string> eventKey {std::to_string(task.eventId)};
 		auto event = co_await session.query(
 			"SELECT task_type,namespace_key,biz_key,payload,payload_version,fingerprint_version FROM hub_event WHERE id=?",
@@ -323,6 +350,15 @@ namespace gamehub
 			"UPDATE delivery_task SET status=1,attempts=attempts+1,generation=generation+1,"
 			"lease_until=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)),updated_at=UTC_TIMESTAMP(6) WHERE id=?",
 			std::move(update));
+		std::vector<std::string> attempt {std::to_string(task.id),
+										  std::to_string(task.eventId),
+										  task.gameId,
+										  std::to_string(task.serverId),
+										  std::to_string(task.generation),
+										  std::to_string(task.attempts)};
+		co_await session.query("INSERT INTO delivery_attempt(task_id,event_id,game_id,server_id,generation,"
+							   "attempt_number,started_at) VALUES(?,?,?,?,?,?,UTC_TIMESTAMP(6))",
+							   std::move(attempt));
 		co_await session.query("COMMIT");
 		co_return task;
 	}
@@ -403,6 +439,12 @@ namespace gamehub
 			co_return 0;
 		}
 		auto keys = rowKeys(selected);
+		// 与 claim/finish 一样先持有任务锁，再更新它的尝试；尝试记录不存在时仍按租约回收任务。
+		co_await session.query("UPDATE delivery_attempt a JOIN delivery_task t ON t.id=a.task_id "
+							   "AND t.generation=a.generation SET a.finished_at=UTC_TIMESTAMP(6),"
+							   "a.outcome='lease_expired',a.error_category='lease_expired' WHERE t.id IN ("
+								   + keys.placeholders + ") AND a.finished_at IS NULL",
+							   keys.params);
 		keys.params.insert(keys.params.begin(), std::to_string(config.maxAttempts));
 		auto result = co_await session.query(
 			"UPDATE delivery_task FORCE INDEX(PRIMARY) SET status=IF(attempts>=?,3,0),generation=generation+1,"
@@ -435,11 +477,13 @@ namespace gamehub
 									  unsigned maxAttempts)
 	{
 		auto session = co_await database_->acquire();
+		co_await session.query("START TRANSACTION");
 		const auto status =
 			success ? TaskStatus::Done : (task.attempts >= maxAttempts ? TaskStatus::Failed : TaskStatus::Pending);
+		error = fixedDeliveryError(success, std::move(error));
 		std::vector<std::string> params {std::to_string(static_cast<int>(status)),
 										 std::to_string(delay),
-										 std::move(error),
+										 error,
 										 std::to_string(task.id),
 										 std::to_string(task.generation)};
 		auto result = co_await session.query(
@@ -447,7 +491,20 @@ namespace gamehub
 			"next_retry_at=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)),last_error=?,updated_at=UTC_TIMESTAMP(6) "
 			"WHERE id=? AND generation=? AND status=1 AND lease_until>UTC_TIMESTAMP(6)",
 			std::move(params));
-		co_return result.affected_rows() == 1;
+		const bool updated = result.affected_rows() == 1;
+		if (updated)
+		{
+			std::vector<std::string> attempt {success ? "success" : "failure",
+											  error,
+											  std::to_string(task.id),
+											  std::to_string(task.generation)};
+			co_await session.query(
+				"UPDATE delivery_attempt SET finished_at=UTC_TIMESTAMP(6),outcome=?,error_category=? "
+				"WHERE task_id=? AND generation=? AND finished_at IS NULL",
+				std::move(attempt));
+		}
+		co_await session.query("COMMIT");
+		co_return updated;
 	}
 
 	Awaitable<boost::json::array> Store::listTasks(std::string gameId, std::uint64_t after)
@@ -721,8 +778,11 @@ namespace gamehub
 			throw ApiError(404, "配置版本不存在");
 		}
 		auto row = result.rows()[0];
+		auto content = boost::json::parse(text(row[1]));
+		const auto canonicalContent = canonicalJson(content);
 		co_return boost::json::object {{"version", number(row[0])},
-									   {"content", boost::json::parse(text(row[1]))},
+									   {"content", std::move(content)},
+									   {"canonicalContent", canonicalContent},
 									   {"sha256", text(row[2])}};
 	}
 

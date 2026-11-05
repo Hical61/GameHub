@@ -56,6 +56,7 @@ namespace gamehub
 			DeliveryScheduler* scheduler_ = nullptr;
 			std::size_t gameIndex_ = 0;
 			std::optional<std::uint32_t> serverId_;
+			unsigned admittedTargetLimit_ = 0;
 		};
 
 		/// @param config 启动后只读配置；预占对象必须比调度器先销毁，所有方法在同一事件循环调用。
@@ -67,6 +68,13 @@ namespace gamehub
 		std::size_t enabledGames() const;
 		/// @param gameId 非空时仅返回该游戏；未知游戏抛 404。@return 本进程配额、在途量及结果计数。
 		boost::json::object snapshot(std::string_view gameId = {}) const;
+		/// @param gameId 已配置游戏；enabled 是否领取；gameLimit/targetLimit 为0时自动分配；revision 控制版本。
+		/// @return 无；降低配额只阻止新领取，已有预占仍正常释放；旧版本不覆盖新版本。
+		void applyControl(std::string_view gameId,
+						  bool enabled,
+						  unsigned gameLimit,
+						  unsigned targetLimit,
+						  std::uint64_t revision);
 
 	private:
 		struct Counters
@@ -103,12 +111,16 @@ namespace gamehub
 			unsigned inFlight = 0;
 			Counters counters;
 			std::vector<Target> targets;
+			unsigned configuredLimit = 0;
+			unsigned configuredTargetLimit = 0;
+			std::uint64_t controlRevision = 0;
 		};
 
 		static void countOutcome(Counters& counters, DeliveryOutcome outcome) noexcept;
 		static boost::json::object countersJson(const Counters& counters);
 		boost::json::object gameJson(const Game& game) const;
 		Target& target(Game& game, std::uint32_t serverId);
+		void refreshLimits();
 		std::vector<Game> games_;
 		std::size_t nextGame_ = 0;
 		std::size_t enabledGames_ = 0;

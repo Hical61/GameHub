@@ -29,8 +29,14 @@ jobs:
         run: python scripts/check-release.py --all-files
       - name: 发布历史检查
         run: python scripts/check-history.py
+      - name: 公开源码完整性检查
+        run: python scripts/check-public-source.py --output .local/public-source-check/ci
       - name: Python 语法检查
         run: python -m compileall -q scripts examples tests
+      - name: C++ 格式检查
+        run: |
+          python -m pip install --disable-pip-version-check clang-format==22.1.2
+          python scripts/check-style.py
       - name: Python 回归
         run: python -m unittest discover -s tests -p "test_*.py"
   windows-msvc:
@@ -69,10 +75,12 @@ jobs:
         run: |
           & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: 准备独立公开源码
+        run: python scripts/check-public-source.py --output .local/public-source-check/ci
       - name: 安装依赖并配置 MSVC
         timeout-minutes: 75
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          cmake -S .local/public-source-check/ci -B build -G "Visual Studio 17 2022" -A x64 `
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_MANIFEST_MODE=ON -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DVCPKG_HOST_TRIPLET=x64-windows -DGAMEHUB_BUILD_TESTS=ON `
@@ -85,6 +93,28 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: 核心测试
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+      - name: 独立宿主接入检查
+        timeout-minutes: 20
+        run: |
+          cmake -S .local/public-source-check/ci/examples/custom-host -B build-custom-host `
+            -G "Visual Studio 17 2022" -A x64 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_INSTALL=OFF -DVCPKG_TARGET_TRIPLET=x64-windows `
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/build/vcpkg_installed" `
+            "-DGAMEHUB_HICAL_SOURCE=$env:GITHUB_WORKSPACE/_deps/hical"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build-custom-host --config RelWithDebInfo --target synthetic_gamehub_host --parallel 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $hostSecretNames = @('GAMEHUB_HUBDB_PASSWORD', 'GAMEHUB_SYNTHETIC_ADMIN_SECRET',
+            'GAMEHUB_SYNTHETIC_CALLBACK_SECRET', 'GAMEHUB_SYNTHETIC_OUTBOUND_SECRET')
+          foreach ($hostSecretName in $hostSecretNames) {
+            $hostSecretValue = python -c "import secrets; print(secrets.token_hex(32))"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            [Environment]::SetEnvironmentVariable($hostSecretName, $hostSecretValue, 'Process')
+          }
+          & ./build-custom-host/RelWithDebInfo/synthetic_gamehub_host.exe `
+            --config .local/public-source-check/ci/examples/custom-host/gamehub.example.json --check-config
+          exit $LASTEXITCODE
       - name: Python 语法检查
         run: python -m compileall -q scripts examples tests
       - name: 安装检查

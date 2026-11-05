@@ -11,7 +11,12 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(GAMEHUB_HICAL_SOURCE "" CACHE PATH "可选的 Hical 源码目录")
-option(GAMEHUB_BUILD_TESTS "构建测试" ON)
+option(GAMEHUB_BUILD_APP "构建默认演示服务" ${PROJECT_IS_TOP_LEVEL})
+option(GAMEHUB_BUILD_TESTS "构建测试" ${PROJECT_IS_TOP_LEVEL})
+option(GAMEHUB_ENABLE_INSTALL "生成默认服务安装规则" ${PROJECT_IS_TOP_LEVEL})
+if(GAMEHUB_ENABLE_INSTALL AND NOT GAMEHUB_BUILD_APP)
+    message(FATAL_ERROR "安装默认服务需要 GAMEHUB_BUILD_APP=ON；只嵌入库时请设置 GAMEHUB_ENABLE_INSTALL=OFF。")
+endif()
 if(GAMEHUB_HICAL_SOURCE)
     set(HICAL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(HICAL_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -54,7 +59,7 @@ endif()
 
 add_library(gamehub_core
     src/core/Config.cpp src/core/Crypto.cpp src/core/Domain.cpp src/core/GameAdapter.cpp
-    src/core/DeliveryProtocol.cpp src/core/DeliveryScheduler.cpp)
+    src/core/DeliveryProtocol.cpp src/core/DeliveryScheduler.cpp src/core/Observability.cpp)
 target_include_directories(gamehub_core PUBLIC src)
 target_link_libraries(gamehub_core PUBLIC Boost::json OpenSSL::Crypto)
 if(WIN32)
@@ -71,14 +76,24 @@ add_library(gamehub_adapters
 target_link_libraries(gamehub_adapters PUBLIC gamehub_core)
 add_library(gamehub_bootstrap src/bootstrap/AdapterCatalog.cpp)
 target_link_libraries(gamehub_bootstrap PUBLIC gamehub_adapters)
-add_library(gamehub_storage src/storage/Database.cpp src/storage/Store.cpp)
+add_library(gamehub_storage src/storage/Database.cpp src/storage/Store.cpp src/storage/StoreOperations.cpp)
 target_link_libraries(gamehub_storage PUBLIC gamehub_core hical::hical_core Boost::charconv)
 add_library(gamehub_service
-    src/service/DeliveryWorker.cpp src/service/Application.cpp src/service/IngressLimits.cpp)
+    src/service/DeliveryWorker.cpp src/service/Application.cpp src/service/ApplicationOperations.cpp
+    src/service/ApplicationTasks.cpp src/service/ApplicationMetrics.cpp src/service/IngressLimits.cpp)
 target_link_libraries(gamehub_service PUBLIC gamehub_core gamehub_storage)
-add_executable(gamehub src/main.cpp)
-target_link_libraries(gamehub PRIVATE gamehub_service gamehub_bootstrap)
-foreach(target gamehub_core gamehub_adapters gamehub_bootstrap gamehub_storage gamehub_service gamehub)
+add_library(GameHub::core ALIAS gamehub_core)
+add_library(GameHub::adapters ALIAS gamehub_adapters)
+add_library(GameHub::bootstrap ALIAS gamehub_bootstrap)
+add_library(GameHub::storage ALIAS gamehub_storage)
+add_library(GameHub::service ALIAS gamehub_service)
+set(gamehubTargets gamehub_core gamehub_adapters gamehub_bootstrap gamehub_storage gamehub_service)
+if(GAMEHUB_BUILD_APP)
+    add_executable(gamehub src/main.cpp)
+    target_link_libraries(gamehub PRIVATE GameHub::service GameHub::bootstrap)
+    list(APPEND gamehubTargets gamehub)
+endif()
+foreach(target IN LISTS gamehubTargets)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /utf-8 /permissive- /bigobj /EHsc /Zc:preprocessor /Zc:__cplusplus)
     else()
@@ -94,6 +109,9 @@ if(GAMEHUB_BUILD_TESTS)
     add_executable(gamehub_scheduler_tests tests/scheduler_tests.cpp)
     target_link_libraries(gamehub_scheduler_tests PRIVATE gamehub_core)
     add_test(NAME gamehub_scheduler COMMAND gamehub_scheduler_tests)
+    add_executable(gamehub_observability_tests tests/observability_tests.cpp)
+    target_link_libraries(gamehub_observability_tests PRIVATE gamehub_core)
+    add_test(NAME gamehub_observability COMMAND gamehub_observability_tests)
     add_executable(gamehub_storage_tests tests/storage_tests.cpp)
     target_link_libraries(gamehub_storage_tests PRIVATE gamehub_storage)
     add_executable(gamehub_response_limit_client tests/response_limit_client.cpp)
@@ -108,28 +126,31 @@ if(GAMEHUB_BUILD_TESTS)
     if(MSVC)
         target_compile_options(gamehub_core_tests PRIVATE /W4 /utf-8 /permissive- /Zc:preprocessor /Zc:__cplusplus)
         target_compile_options(gamehub_scheduler_tests PRIVATE /W4 /utf-8 /permissive- /Zc:preprocessor /Zc:__cplusplus)
+        target_compile_options(gamehub_observability_tests PRIVATE /W4 /utf-8 /permissive- /Zc:preprocessor /Zc:__cplusplus)
         target_compile_options(gamehub_storage_tests PRIVATE /W4 /utf-8 /permissive- /bigobj /Zc:preprocessor /Zc:__cplusplus)
         target_compile_options(gamehub_response_limit_client PRIVATE /W4 /utf-8 /permissive- /bigobj /EHsc /Zc:preprocessor /Zc:__cplusplus)
     endif()
     # 存储测试由 integration.py 建好临时数据库后运行，不直接连接已有数据库。
 endif()
-if(WIN32)
-    # 安装时解析 EXE 的 DLL 依赖；构建目录和编译器目录分别覆盖 vcpkg 与 MinGW。
-    get_filename_component(gamehubCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    install(TARGETS gamehub
-        RUNTIME_DEPENDENCIES
-            DIRECTORIES "$<TARGET_FILE_DIR:gamehub>" "${gamehubCompilerDirectory}"
-            PRE_EXCLUDE_REGEXES "api-ms-.*" "ext-ms-.*"
-            POST_EXCLUDE_REGEXES "[/\\\\][Ss][Yy][Ss][Tt][Ee][Mm]32[/\\\\]"
-        RUNTIME DESTINATION bin)
-    if(MSVC)
-        # 系统目录里的 DLL 不复制；MSVC 运行库从编译器提供的可分发目录安装。
-        include(InstallRequiredSystemLibraries)
+if(GAMEHUB_ENABLE_INSTALL)
+    if(WIN32)
+        # 安装时解析 EXE 的 DLL 依赖；构建目录和编译器目录分别覆盖 vcpkg 与 MinGW。
+        get_filename_component(gamehubCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        install(TARGETS gamehub
+            RUNTIME_DEPENDENCIES
+                DIRECTORIES "$<TARGET_FILE_DIR:gamehub>" "${gamehubCompilerDirectory}"
+                PRE_EXCLUDE_REGEXES "api-ms-.*" "ext-ms-.*"
+                POST_EXCLUDE_REGEXES "[/\\\\][Ss][Yy][Ss][Tt][Ee][Mm]32[/\\\\]"
+            RUNTIME DESTINATION bin)
+        if(MSVC)
+            # 系统目录里的 DLL 不复制；MSVC 运行库从编译器提供的可分发目录安装。
+            include(InstallRequiredSystemLibraries)
+        endif()
+    else()
+        install(TARGETS gamehub RUNTIME DESTINATION bin)
     endif()
-else()
-    install(TARGETS gamehub RUNTIME DESTINATION bin)
+    install(FILES config/gamehub.example.json DESTINATION config)
+    install(DIRECTORY migrations DESTINATION share/gamehub)
+    include(cmake/InstallLicenses.cmake)
+    gamehub_install_licenses()
 endif()
-install(FILES config/gamehub.example.json DESTINATION config)
-install(DIRECTORY migrations DESTINATION share/gamehub)
-include(cmake/InstallLicenses.cmake)
-gamehub_install_licenses()

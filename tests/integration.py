@@ -282,10 +282,15 @@ class Fixture:
         # 仅本次独立临时实例的存储测试需要观察 root definer 触发器内的连接。
         # 退出存储测试后先撤销 PROCESS，再以原有四项 DML 权限启动 Hub。
         self.sql("GRANT PROCESS ON *.* TO 'gamehub'@'localhost'")
+        # 仅故障注入测试需要在这两张隔离表创建触发器，运行服务前全部撤销。
+        self.sql("GRANT TRIGGER ON gamehub.delivery_attempt TO 'gamehub'@'localhost'; "
+                 "GRANT TRIGGER ON gamehub.audit_log TO 'gamehub'@'localhost'")
         try:
             result = subprocess.run([str(storage), str(self.config)], capture_output=True, env=self.env,
                                     timeout=self.operation_timeout(30))
         finally:
+            self.sql("REVOKE TRIGGER ON gamehub.delivery_attempt FROM 'gamehub'@'localhost'; "
+                     "REVOKE TRIGGER ON gamehub.audit_log FROM 'gamehub'@'localhost'")
             self.sql("REVOKE PROCESS ON *.* FROM 'gamehub'@'localhost'")
         if result.returncode:
             print(result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace"))
@@ -351,15 +356,17 @@ class Fixture:
                 return False
         wait_for(ready, "GameHub 就绪")
 
-    def request(self, method, path, value=None, admin=None, signed=False, chunked=False, raw=None):
+    def request(self, method, path, value=None, admin=None, signed=False, chunked=False, raw=None, key_id="", secret_env=None):
         body = raw if raw is not None else (json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode() if value is not None else b"")
         headers = {"Content-Type": "application/json"}
         if admin:
             headers["Authorization"] = "Bearer " + admin
         if signed:
             timestamp = str(int(time.time()))
-            secret = self.env["GAMEHUB_DEMO_CALLBACK_SECRET" if path.startswith("/api/callback/") else "GAMEHUB_DEMO_OUTBOUND_SECRET"]
-            headers.update({"X-Timestamp": timestamp, "X-Signature": signature(secret, timestamp, method, path, body)})
+            secret = self.env[secret_env or ("GAMEHUB_DEMO_CALLBACK_SECRET" if path.startswith("/api/callback/") else "GAMEHUB_DEMO_OUTBOUND_SECRET")]
+            headers.update({"X-Timestamp": timestamp, "X-Signature": signature(secret, timestamp, method, path, body, key_id)})
+            if key_id:
+                headers["X-Key-Id"] = key_id
         deadline = self.http_deadline()
         with closing(http.client.HTTPConnection("127.0.0.1", self.http_port,
                                                timeout=deadline.timeout())) as connection:
@@ -863,6 +870,8 @@ def verify(fixture):
     assert f.request("GET", "/internal/config/demo/1/0", signed=True)[0] == 200
     print("通过：回调限流洪峰不挤占健康探针、管理接口和配置拉取")
     verify_retry_limit(f)
+    from operations_api_integration import verify as verify_operations_api
+    verify_operations_api(f)
 
 
 def submitted(fixture, game_id, channel, key, server_id=1):

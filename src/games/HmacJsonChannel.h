@@ -16,7 +16,7 @@ namespace gamehub
 		HmacJsonChannel(const GameConfig& game, ChannelConfig channel, Normalizer normalize);
 		/// @param request 原始请求，只在调用期间使用；now 当前 UTC 秒。@return 检查通过、自持有的到账通知。
 		Submission parseCallback(const CallbackRequest& request, std::int64_t now) const override;
-		/// @param result 已受理、重复或固定错误。@return 兼容原演示协议的 JSON 应答。
+		/// @param result 已受理、重复或固定错误。@return 演示协议的 JSON 应答。
 		CallbackReply reply(const CallbackResult& result) const override;
 
 	private:

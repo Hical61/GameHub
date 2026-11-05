@@ -16,6 +16,7 @@ namespace gamehub
 		std::string_view method;
 		std::string_view path;
 		std::string_view body;
+		std::string_view keyId {};
 	};
 
 	struct CallbackRequest
@@ -61,6 +62,13 @@ namespace gamehub
 		virtual std::string_view gameId() const = 0;
 		/// @param request 请求视图，只在调用期间使用。@return 出向签名字符串。
 		virtual std::string signOutbound(const SignedRequest& request) const = 0;
+
+		/// @return 当前出向密钥标识；空值表示保持旧协议，不发送 X-Key-Id。
+		virtual std::string_view outboundKeyId() const
+		{
+			return {};
+		}
+
 		/// @param request 请求视图；now 当前 UTC 秒。@return 游戏服拉取请求是否可信。
 		virtual bool verifyInternalRequest(const SignedRequest& request, std::int64_t now) const = 0;
 	};

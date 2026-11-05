@@ -55,6 +55,7 @@ namespace gamehub
 					throw ConfigError("该游戏适配器需要显式配置 channels");
 				}
 				channels.push_back({channel, game.adapter, channel, game.callbackSecret, {}});
+				channels.back().keys = game.callbackKeys;
 			}
 			for (const auto& channel : channels)
 			{

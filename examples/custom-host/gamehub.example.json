@@ -1,0 +1,56 @@
+{
+  "server": {
+    "listen": "127.0.0.1",
+    "port": 8443,
+    "maxBodyBytes": 65536,
+    "maxConnections": 1024
+  },
+  "hubDb": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "synthetic_hub",
+    "user": "synthetic_runtime",
+    "maxConnections": 8
+  },
+  "worker": {
+    "games": ["synthetic-game"],
+    "pollMs": 1000,
+    "maxTasksPerTick": 16,
+    "concurrency": 4,
+    "leaseSeconds": 60,
+    "maxAttempts": 8,
+    "baseRetrySeconds": 2,
+    "maxRetrySeconds": 300,
+    "connectTimeoutMs": 2000,
+    "requestTimeoutMs": 5000,
+    "maxResponseBodyBytes": 16384
+  },
+  "auth": {
+    "jwtSecretEnv": "GAMEHUB_SYNTHETIC_ADMIN_SECRET",
+    "issuer": "gamehub-admin",
+    "audience": "gamehub"
+  },
+  "games": [
+    {
+      "id": "synthetic-game",
+      "adapter": "synthetic-game-v1",
+      "outboundSecretEnv": "GAMEHUB_SYNTHETIC_OUTBOUND_SECRET",
+      "channels": [
+        {
+          "id": "synthetic-channel",
+          "adapter": "synthetic-channel-v1",
+          "namespace": "synthetic-merchant",
+          "secretEnv": "GAMEHUB_SYNTHETIC_CALLBACK_SECRET"
+        }
+      ],
+      "servers": [
+        {
+          "id": 1,
+          "host": "127.0.0.1",
+          "port": 9001,
+          "target": "/internal/gamehub"
+        }
+      ]
+    }
+  ]
+}

@@ -31,7 +31,8 @@ namespace gamehub
 		}
 	} // namespace
 
-	DbSession::DbSession(boost::mysql::pooled_connection connection) : connection_(std::move(connection))
+	DbSession::DbSession(boost::mysql::pooled_connection connection, std::shared_ptr<DatabaseMetrics> metrics)
+		: connection_(std::move(connection)), metrics_(std::move(metrics))
 	{
 	}
 
@@ -39,6 +40,24 @@ namespace gamehub
 	{
 		namespace asio = boost::asio;
 		const auto deadline = std::chrono::steady_clock::now() + kQueryTimeout;
+		const auto started = std::chrono::steady_clock::now();
+
+		struct Observation
+		{
+			DatabaseMetrics* metrics;
+			std::chrono::steady_clock::time_point started;
+
+			~Observation()
+			{
+				if (metrics)
+				{
+					++metrics->queries;
+					metrics->querySeconds.observe(
+						std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+				}
+			}
+		} observation {metrics_.get(), started};
+
 		boost::mysql::results result;
 		try
 		{
@@ -64,6 +83,13 @@ namespace gamehub
 		}
 		catch (const boost::system::system_error& error)
 		{
+			if (metrics_)
+			{
+				++metrics_->errors;
+				metrics_->deadlocks +=
+					error.code() == boost::mysql::make_error_code(boost::mysql::common_server_errc::er_lock_deadlock);
+				metrics_->cancellations += error.code() == asio::error::operation_aborted;
+			}
 			if (boost::mysql::is_fatal_error(error.code()))
 			{
 				// 取消后可能残留旧响应，不能让连接池误当成 reset 成功后继续复用。
@@ -87,9 +113,27 @@ namespace gamehub
 
 	Awaitable<DbSession> Database::acquire()
 	{
-		auto connection =
-			co_await pool_.async_get_connection(boost::asio::cancel_after(kAcquireTimeout, boost::asio::use_awaitable));
-		co_return DbSession(std::move(connection));
+		const auto started = std::chrono::steady_clock::now();
+		try
+		{
+			auto connection = co_await pool_.async_get_connection(
+				boost::asio::cancel_after(kAcquireTimeout, boost::asio::use_awaitable));
+			metrics_->acquireSeconds.observe(
+				std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+			co_return DbSession(std::move(connection), metrics_);
+		}
+		catch (...)
+		{
+			++metrics_->acquireErrors;
+			metrics_->acquireSeconds.observe(
+				std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+			throw;
+		}
+	}
+
+	const DatabaseMetrics& Database::metrics() const
+	{
+		return *metrics_;
 	}
 
 	void Database::stop()

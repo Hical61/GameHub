@@ -15,6 +15,7 @@
   "worker": {
     "games": [],
     "pollMs": 1000,
+    "maxTasksPerTick": 16,
     "concurrency": 4,
     "leaseSeconds": 60,
     "maxAttempts": 8,

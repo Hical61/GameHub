@@ -1,0 +1,40 @@
+# 部署在Hub同机的出向代理：Hub目标指向127.0.0.1:9443，签名路径仍为/internal/gamehub。
+# 修改主机名及证书路径后先执行nginx -t；私钥放仓库外并仅允许代理服务账号读取。
+# game-server.internal的接收代理必须校验客户端证书，并只开放预期的内部接口。
+server {
+    listen 127.0.0.1:9443;
+    server_name localhost;
+    client_max_body_size 64k;
+    client_body_timeout 5s;
+    location = /internal/gamehub {
+        proxy_pass https://game-server.internal:9443;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+        proxy_send_timeout 5s;
+        proxy_ssl_server_name on;
+        proxy_ssl_name game-server.internal;
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 2;
+        proxy_ssl_trusted_certificate /etc/gamehub/tls/game-ca.crt;
+        proxy_ssl_certificate /etc/gamehub/tls/hub-client.crt;
+        proxy_ssl_certificate_key /etc/gamehub/tls/hub-client.key;
+        proxy_set_header Host game-server.internal;
+    }
+    location / { return 404; }
+}
+
+# Hub侧专用的游戏服入向mTLS入口，用于配置拉取及应用回报。
+# 该端口只允许游戏内网访问；证书SAN须与游戏端使用的Hub域名一致。
+server {
+    listen 10.0.0.10:9444 ssl;
+    server_name hub.internal;
+    ssl_certificate /etc/gamehub/tls/hub-server.crt;
+    ssl_certificate_key /etc/gamehub/tls/hub-server.key;
+    ssl_client_certificate /etc/gamehub/tls/game-client-ca.crt;
+    ssl_verify_client on;
+    ssl_verify_depth 2;
+    client_max_body_size 64k;
+    location /internal/config/ { proxy_pass http://127.0.0.1:8443; }
+    location /internal/config-applied/ { proxy_pass http://127.0.0.1:8443; }
+    location / { return 404; }
+}

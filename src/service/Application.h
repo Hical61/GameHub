@@ -21,6 +21,9 @@ namespace gamehub
 	private:
 		void registerRoutes();
 		void registerTasks();
+		void registerDeliveryTasks();
+		Awaitable<void> refreshControl();
+		Awaitable<void> recoverAndRefresh();
 		Awaitable<hical::HttpResponse> handle(const hical::HttpRequest& request);
 		Awaitable<hical::HttpResponse> dispatch(const hical::HttpRequest& request);
 		Awaitable<hical::HttpResponse> callback(const hical::HttpRequest& request);
@@ -28,6 +31,9 @@ namespace gamehub
 		Awaitable<hical::HttpResponse> adminRead(const hical::HttpRequest& request);
 		Awaitable<hical::HttpResponse> archive(const hical::HttpRequest& request, std::string actor);
 		Awaitable<hical::HttpResponse> metrics();
+		Awaitable<hical::HttpResponse> operationsRead(const hical::HttpRequest& request);
+		Awaitable<hical::HttpResponse> controlWrite(const hical::HttpRequest& request, std::string actor);
+		Awaitable<hical::HttpResponse> configApplied(const hical::HttpRequest& request);
 		std::string authenticateAdmin(const hical::HttpRequest& request, bool write) const;
 		Submission submission(const hical::HttpRequest& request, std::string taskType, std::string actor) const;
 		void stop();
@@ -47,5 +53,8 @@ namespace gamehub
 		std::uint64_t accepted_ = 0;
 		std::uint64_t duplicates_ = 0;
 		std::uint64_t rejected_ = 0;
+		std::uint64_t recovered_ = 0;
+		std::unordered_map<std::string, LatencyHistogram> callbackLatencies_;
+		std::chrono::steady_clock::time_point nextSchemaCheck_ {};
 	};
 } // namespace gamehub

@@ -37,6 +37,63 @@ namespace gamehub
 			return value->as_object();
 		}
 
+		bool validKeyId(std::string_view keyId)
+		{
+			return validKey(keyId, kMaxKeyIdLength) && keyId != "." && keyId != "..";
+		}
+
+		KeyRotation parseKeyRotation(const boost::json::object& object,
+									 std::string_view currentSecret,
+									 std::string_view idField,
+									 std::string_view previousField,
+									 std::string_view legacyField)
+		{
+			KeyRotation rotation;
+			if (!object.if_contains(idField) && !object.if_contains(previousField) && !object.if_contains(legacyField))
+			{
+				return rotation;
+			}
+			if (!object.if_contains(idField))
+			{
+				throw ConfigError("配置旧验签密钥时必须指定当前密钥标识");
+			}
+			rotation.currentKeyId = requiredString(object, idField, kMaxKeyIdLength);
+			if (!validKeyId(rotation.currentKeyId) || currentSecret.size() < 32)
+			{
+				throw ConfigError("轮换需要有效的当前密钥标识和至少 32 字节的当前密钥");
+			}
+			if (object.if_contains(legacyField))
+			{
+				rotation.legacySecret = secretFromEnv(requiredString(object, legacyField, 96), 32);
+			}
+			const auto* previous = object.if_contains(previousField);
+			if (!previous)
+			{
+				return rotation;
+			}
+			if (!previous->is_array() || previous->as_array().size() > kMaxPreviousVerificationKeys)
+			{
+				throw ConfigError("旧验签密钥必须是至多 8 项的数组");
+			}
+			std::set<std::string> keyIds {rotation.currentKeyId};
+			for (const auto& value : previous->as_array())
+			{
+				if (!value.is_object())
+				{
+					throw ConfigError("旧验签密钥配置必须是对象");
+				}
+				const auto& key = value.as_object();
+				auto keyId = requiredString(key, "keyId", kMaxKeyIdLength);
+				if (!validKeyId(keyId) || !keyIds.insert(keyId).second)
+				{
+					throw ConfigError("验签密钥标识无效或重复");
+				}
+				rotation.previousKeys.push_back(
+					{std::move(keyId), secretFromEnv(requiredString(key, "secretEnv", 96), 32)});
+			}
+			return rotation;
+		}
+
 		unsigned optionalUnsigned(const boost::json::object& object,
 								  std::string_view key,
 								  unsigned fallback,
@@ -78,6 +135,7 @@ namespace gamehub
 			worker.games = parseWorkerGames(object);
 			worker.pollMs = static_cast<unsigned>(requiredInt(object, "pollMs", 10, 60000));
 			worker.concurrency = static_cast<unsigned>(requiredInt(object, "concurrency", 1, 32));
+			worker.maxTasksPerTick = optionalUnsigned(object, "maxTasksPerTick", 16, 1, 256);
 			worker.leaseSeconds = static_cast<unsigned>(requiredInt(object, "leaseSeconds", 10, 3600));
 			worker.maxAttempts = static_cast<unsigned>(requiredInt(object, "maxAttempts", 1, 100));
 			worker.baseRetrySeconds = static_cast<unsigned>(requiredInt(object, "baseRetrySeconds", 1, 3600));
@@ -115,6 +173,7 @@ namespace gamehub
 			{
 				channel.secret = secretFromEnv(requiredString(object, "secretEnv", 96), 32);
 			}
+			channel.keys = parseKeyRotation(object, channel.secret, "keyId", "previousKeys", "legacySecretEnv");
 			if (object.if_contains("options"))
 			{
 				channel.options = objectAt(object, "options");
@@ -144,6 +203,11 @@ namespace gamehub
 			if (!channels)
 			{
 				game.callbackSecret = secretFromEnv(requiredString(object, "callbackSecretEnv", 96), 32);
+				game.callbackKeys = parseKeyRotation(object,
+													 game.callbackSecret,
+													 "callbackKeyId",
+													 "callbackPreviousKeys",
+													 "callbackLegacySecretEnv");
 				return;
 			}
 			if (!channels->is_array() || channels->as_array().empty() || channels->as_array().size() > 32)
@@ -176,6 +240,11 @@ namespace gamehub
 			{
 				game.outboundSecret = secretFromEnv(requiredString(object, "outboundSecretEnv", 96), 32);
 			}
+			game.outboundKeys = parseKeyRotation(object,
+												 game.outboundSecret,
+												 "outboundKeyId",
+												 "outboundPreviousKeys",
+												 "outboundLegacySecretEnv");
 			const auto& servers = object.at("servers").as_array();
 			if (servers.empty() || servers.size() > 1000)
 			{
@@ -245,6 +314,7 @@ namespace gamehub
 		result.dbPassword = secretFromEnv("GAMEHUB_HUBDB_PASSWORD", 1);
 		result.dbMaxConnections = static_cast<unsigned>(requiredInt(db, "maxConnections", 2, 128));
 		result.jwtSecret = secretFromEnv(requiredString(auth, "jwtSecretEnv", 96), 32);
+		result.jwtKeys = parseKeyRotation(auth, result.jwtSecret, "jwtKeyId", "jwtPreviousKeys", "jwtLegacySecretEnv");
 		result.jwtIssuer = requiredString(auth, "issuer", 96);
 		result.jwtAudience = requiredString(auth, "audience", 96);
 		result.worker = parseWorker(objectAt(root, "worker"));
@@ -283,6 +353,32 @@ namespace gamehub
 			}
 		}
 		throw ApiError(404, "游戏不存在");
+	}
+
+	std::string_view selectVerificationKey(std::string_view currentSecret,
+										   const KeyRotation& rotation,
+										   std::string_view keyId)
+	{
+		if (keyId.empty())
+		{
+			return rotation.currentKeyId.empty() ? currentSecret : std::string_view(rotation.legacySecret);
+		}
+		if (rotation.currentKeyId.empty())
+		{
+			return {};
+		}
+		if (keyId == rotation.currentKeyId)
+		{
+			return currentSecret;
+		}
+		for (const auto& key : rotation.previousKeys)
+		{
+			if (key.keyId == keyId)
+			{
+				return key.secret;
+			}
+		}
+		return {};
 	}
 
 	const ServerEndpoint& GameConfig::endpoint(std::uint32_t serverId) const

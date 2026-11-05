@@ -2,7 +2,7 @@
 /out/
 /_deps/
 /.local/
-/docs/
+/private/
 /vcpkg_installed/
 /.vs/
 /.idea/

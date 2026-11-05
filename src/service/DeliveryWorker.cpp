@@ -39,7 +39,7 @@ namespace gamehub
 	{
 	}
 
-	Awaitable<void> DeliveryWorker::tick()
+	Awaitable<bool> DeliveryWorker::tick()
 	{
 		std::vector<std::string> checked;
 		const auto budget = std::min(kMaxGameChecksPerTick, scheduler_.enabledGames());
@@ -48,7 +48,7 @@ namespace gamehub
 			auto reservation = scheduler_.reserve(checked);
 			if (!reservation)
 			{
-				co_return;
+				co_return false;
 			}
 			checked.emplace_back(reservation->gameId());
 			// 预占已计入游戏配额，同游戏领取串行化；目标登记后下一笔领取才能看到满额目标。
@@ -58,9 +58,12 @@ namespace gamehub
 				continue;
 			}
 			DeliveryResult result;
+			const auto started = std::chrono::steady_clock::now();
+			bool targetRegistered = false;
 			try
 			{
 				reservation->attach(claimed->serverId);
+				targetRegistered = true;
 				result = co_await deliver(*claimed);
 			}
 			catch (const boost::system::system_error& error)
@@ -74,9 +77,15 @@ namespace gamehub
 			{
 				// 固定分类不包含 SQL 参数、玩家字段或第三方响应。
 			}
+			if (targetRegistered)
+			{
+				latencies_[{claimed->gameId, claimed->serverId}].delivery.observe(
+					std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+			}
 			co_await finish(*claimed, std::move(result), *reservation);
-			co_return;
+			co_return true;
 		}
+		co_return false;
 	}
 
 	Awaitable<DeliveryWorker::DeliveryResult> DeliveryWorker::deliver(const DeliveryTask& task)
@@ -88,9 +97,14 @@ namespace gamehub
 		hical::HeaderMap headers;
 		headers.set("Content-Type", "application/json");
 		headers.set("X-Timestamp", timestamp);
-		headers.set(
-			"X-Signature",
-			registry_.find(task.gameId).signOutbound(SignedRequest {timestamp, {}, "POST", endpoint.target, body}));
+		const auto keyId = registry_.find(task.gameId).outboundKeyId();
+		if (!keyId.empty())
+		{
+			headers.set("X-Key-Id", std::string(keyId));
+		}
+		headers.set("X-Signature",
+					registry_.find(task.gameId)
+						.signOutbound(SignedRequest {timestamp, {}, "POST", endpoint.target, body, keyId}));
 		hical::HttpClientOptions options;
 		options.connectTimeout = std::chrono::milliseconds(config_.worker.connectTimeoutMs);
 		options.requestTimeout = std::chrono::milliseconds(config_.worker.requestTimeoutMs);
@@ -143,6 +157,14 @@ namespace gamehub
 			throw;
 		}
 		reservation.complete(updated ? result.outcome : DeliveryOutcome::LeaseLost);
+		if (updated && result.success && task.createdAtUnixMicros > 0)
+		{
+			const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+								 std::chrono::system_clock::now().time_since_epoch())
+								 .count();
+			latencies_[{task.gameId, task.serverId}].completed.observe(
+				static_cast<double>(std::max<std::int64_t>(0, now - task.createdAtUnixMicros)) / 1'000'000.0);
+		}
 		if (!updated)
 		{
 			HICAL_LOG_WARN("收到投递结果时租约已失效，跳过更新，taskId={}", task.id);
@@ -156,5 +178,26 @@ namespace gamehub
 	boost::json::object DeliveryWorker::snapshot(std::string_view gameId) const
 	{
 		return scheduler_.snapshot(gameId);
+	}
+
+	void DeliveryWorker::applyControl(std::string_view gameId,
+									  bool enabled,
+									  unsigned gameLimit,
+									  unsigned targetLimit,
+									  std::uint64_t revision)
+	{
+		scheduler_.applyControl(gameId, enabled, gameLimit, targetLimit, revision);
+	}
+
+	std::string DeliveryWorker::latencyMetrics() const
+	{
+		std::string output;
+		for (const auto& [identity, metrics] : latencies_)
+		{
+			const auto labels = "game=\"" + identity.first + "\",server=\"" + std::to_string(identity.second) + "\"";
+			output += metrics.delivery.prometheus("gamehub_delivery_seconds", labels);
+			output += metrics.completed.prometheus("gamehub_completion_seconds", labels);
+		}
+		return output;
 	}
 } // namespace gamehub
